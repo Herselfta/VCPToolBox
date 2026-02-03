@@ -1,8 +1,16 @@
 // server.js
 const express = require('express');
 const dotenv = require('dotenv');
+dotenv.config({ path: 'config.env' });
 const schedule = require('node-schedule');
 const lunarCalendar = require('chinese-lunar-calendar');
+const dayjs = require('dayjs');
+const timezone = require('dayjs/plugin/timezone');
+const utc = require('dayjs/plugin/utc');
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'Asia/Shanghai';
 const fs = require('fs').promises; // fs.promises for async operations
 const path = require('path');
 const { Writable } = require('stream');
@@ -13,13 +21,55 @@ const logger = require('./modules/logger.js');
 logger.initializeServerLogger();
 logger.overrideConsole();
 
-const AGENT_DIR = path.join(__dirname, 'Agent'); // 定义 Agent 目录
+// Agent 目录路径初始化（同步，在模块加载时解析）
+let AGENT_DIR;
+
+function resolveAgentDir() {
+    const configPath = process.env.AGENT_DIR_PATH;
+    
+    if (!configPath || typeof configPath !== 'string' || configPath.trim() === '') {
+        return path.join(__dirname, 'Agent');
+    }
+    
+    const normalizedPath = path.normalize(configPath.trim());
+    const absolutePath = path.isAbsolute(normalizedPath)
+        ? normalizedPath
+        : path.resolve(__dirname, normalizedPath);
+    
+    return absolutePath;
+}
+
+AGENT_DIR = resolveAgentDir();
+
+// 确保目录存在（异步，在服务器启动时调用）
+async function ensureAgentDirectory() {
+    try {
+        await fs.mkdir(AGENT_DIR, { recursive: true });
+        console.log(`[Server] Agent directory: ${AGENT_DIR}`);
+    } catch (error) {
+        if (error.code !== 'EEXIST') {
+            console.error(`[Server] Failed to create Agent directory: ${AGENT_DIR}`);
+            
+            if (error.code === 'EACCES' || error.code === 'EPERM') {
+                console.error('[Server] Error: Permission denied');
+            } else if (error.code === 'ENOENT') {
+                console.error('[Server] Error: Parent directory does not exist');
+            } else if (error.code === 'ENOSPC') {
+                console.error('[Server] Error: No space left on device');
+            } else if (error.code === 'ENAMETOOLONG') {
+                console.error('[Server] Error: Path is too long');
+            }
+            
+            process.exit(1);
+        }
+    }
+}
 const TVS_DIR = path.join(__dirname, 'TVStxt'); // 新增：定义 TVStxt 目录
 const crypto = require('crypto');
 const agentManager = require('./modules/agentManager.js'); // 新增：Agent管理器
 const tvsManager = require('./modules/tvsManager.js'); // 新增：TVS管理器
 const messageProcessor = require('./modules/messageProcessor.js');
-const { VectorDBManager } = require('./VectorDBManager.js'); // 新增：引入向量数据库管理器
+const knowledgeBaseManager = require('./KnowledgeBaseManager.js'); // 新增：引入统一知识库管理器
 const pluginManager = require('./Plugin.js');
 const taskScheduler = require('./routes/taskScheduler.js');
 const webSocketServer = require('./WebSocketServer.js'); // 新增 WebSocketServer 引入
@@ -58,14 +108,38 @@ setInterval(() => {
     }
 }, 60 * 1000); // 每分钟检查一次
 
-dotenv.config({ path: 'config.env' });
-
 const ADMIN_USERNAME = process.env.AdminUsername;
 const ADMIN_PASSWORD = process.env.AdminPassword;
 
 const DEBUG_MODE = (process.env.DebugMode || "False").toLowerCase() === "true";
 const VCPToolCode = (process.env.VCPToolCode || "false").toLowerCase() === "true"; // 新增：读取VCP工具调用验证码开关
 const SHOW_VCP_OUTPUT = (process.env.ShowVCP || "False").toLowerCase() === "true"; // 读取 ShowVCP 环境变量
+const RAG_MEMO_REFRESH = (process.env.RAGMemoRefresh || "false").toLowerCase() === "true"; // 新增：RAG日记刷新开关
+const ENABLE_ROLE_DIVIDER = (process.env.EnableRoleDivider || "false").toLowerCase() === "true"; // 新增：角色分割开关
+const ENABLE_ROLE_DIVIDER_IN_LOOP = (process.env.EnableRoleDividerInLoop || "false").toLowerCase() === "true"; // 新增：循环栈角色分割开关
+const ROLE_DIVIDER_SYSTEM = (process.env.RoleDividerSystem || "true").toLowerCase() === "true"; // 新增：System角色分割开关
+const ROLE_DIVIDER_ASSISTANT = (process.env.RoleDividerAssistant || "true").toLowerCase() === "true"; // 新增：Assistant角色分割开关
+const ROLE_DIVIDER_USER = (process.env.RoleDividerUser || "true").toLowerCase() === "true"; // 新增：User角色分割开关
+const ROLE_DIVIDER_SCAN_SYSTEM = (process.env.RoleDividerScanSystem || "true").toLowerCase() === "true"; // 新增：System角色扫描开关
+const ROLE_DIVIDER_SCAN_ASSISTANT = (process.env.RoleDividerScanAssistant || "true").toLowerCase() === "true"; // 新增：Assistant角色扫描开关
+const ROLE_DIVIDER_SCAN_USER = (process.env.RoleDividerScanUser || "true").toLowerCase() === "true"; // 新增：User角色扫描开关
+const ROLE_DIVIDER_REMOVE_DISABLED_TAGS = (process.env.RoleDividerRemoveDisabledTags || "true").toLowerCase() === "true"; // 新增：禁用标签清除开关
+
+let ROLE_DIVIDER_IGNORE_LIST = [];
+try {
+    ROLE_DIVIDER_IGNORE_LIST = JSON.parse(process.env.RoleDividerIgnoreList || "[]");
+} catch (e) {
+    console.error("Failed to parse RoleDividerIgnoreList:", e);
+}
+
+// 新增：国产A类模型推理功能配置
+let CHINA_MODEL_1 = [];
+try {
+    CHINA_MODEL_1 = (process.env.ChinaModel1 || "").split(',').map(m => m.trim()).filter(m => m !== "");
+} catch (e) {
+    console.error("Failed to parse ChinaModel1:", e);
+}
+const CHINA_MODEL_1_COT = (process.env.ChinaModel1Cot || "false").toLowerCase() === "true";
 
 // 新增：模型重定向功能
 const ModelRedirectHandler = require('./modelRedirectHandler.js');
@@ -73,21 +147,28 @@ const modelRedirectHandler = new ModelRedirectHandler();
 
 // ensureDebugLogDir is now ensureDebugLogDirSync and called by initializeServerLogger
 // writeDebugLog remains for specific debug purposes, it uses fs.promises.
+// 优化：Debug 日志按天归档到 archive/YYYY-MM-DD/Debug/ 目录
 async function writeDebugLog(filenamePrefix, data) {
     if (DEBUG_MODE) {
         const DEBUG_LOG_DIR = path.join(__dirname, 'DebugLog');
+        const now = dayjs().tz(DEFAULT_TIMEZONE);
+        const dateStr = now.format('YYYY-MM-DD');
+        const timestamp = now.format('HHmmss_SSS');
+        
+        // 归档目录：DebugLog/archive/YYYY-MM-DD/Debug/
+        const archiveDir = path.join(DEBUG_LOG_DIR, 'archive', dateStr, 'Debug');
+        
         try {
-            await fs.mkdir(DEBUG_LOG_DIR, { recursive: true });
+            await fs.mkdir(archiveDir, { recursive: true });
         } catch (error) {
-            console.error(`创建 DebugLog 目录失败 (async): ${DEBUG_LOG_DIR}`, error);
+            console.error(`创建 Debug 归档目录失败: ${archiveDir}`, error);
         }
-        const now = new Date();
-        const timestamp = `${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}${now.getDate().toString().padStart(2, '0')}_${now.getHours().toString().padStart(2, '0')}${now.getMinutes().toString().padStart(2, '0')}${now.getSeconds().toString().padStart(2, '0')}_${now.getMilliseconds().toString().padStart(3, '0')}`;
+        
         const filename = `${filenamePrefix}-${timestamp}.txt`;
-        const filePath = path.join(DEBUG_LOG_DIR, filename);
+        const filePath = path.join(archiveDir, filename);
         try {
             await fs.writeFile(filePath, JSON.stringify(data, null, 2));
-            console.log(`[DebugLog] 已记录日志: ${filename}`);
+            console.log(`[DebugLog] 已记录日志: archive/${dateStr}/Debug/${filename}`);
         } catch (error) {
             console.error(`写入调试日志失败: ${filePath}`, error);
         }
@@ -146,9 +227,9 @@ for (const key in process.env) {
 if (superDetectors.length > 0) console.log(`共加载了 ${superDetectors.length} 条全局上下文转换规则。`);
 else console.log('未加载任何全局上下文转换规则。');
 
-const vectorDBManager = new VectorDBManager(); // 新增：创建 VectorDBManager 实例
 
 const app = express();
+app.set('trust proxy', true); // 新增：信任代理，以便正确解析 X-Forwarded-For 头，解决本地IP识别为127.0.0.1的问题
 app.use(cors({ origin: '*' })); // 启用 CORS，允许所有来源的跨域请求，方便本地文件调试
 
 // 在路由决策之前解析请求体，以便 req.body 可用
@@ -181,6 +262,12 @@ function handleApiError(req) {
     let clientIp = req.ip;
     if (clientIp && clientIp.substr(0, 7) === "::ffff:") {
         clientIp = clientIp.substr(7);
+    }
+
+    // Don't blacklist the server itself.
+    if (clientIp === '127.0.0.1' || clientIp === '::1') {
+        console.log(`[Security] Ignored an API error from the local server itself (IP: ${clientIp}). This is to prevent self-blocking.`);
+        return;
     }
 
     if (!clientIp || ipBlacklist.includes(clientIp)) {
@@ -232,6 +319,24 @@ const adminAuth = (req, res, next) => {
     const isAdminPath = req.path.startsWith('/admin_api') || req.path.startsWith('/AdminPanel');
 
     if (isAdminPath) {
+        // ========== 新增：允许登录页面和相关资源无需认证 ==========
+        const publicPaths = [
+            '/AdminPanel/login.html',
+            '/AdminPanel/VCPLogo2.png',
+            '/AdminPanel/favicon.ico',
+            '/AdminPanel/style.css',
+            '/AdminPanel/woff.css',
+            '/AdminPanel/font.woff2'
+        ];
+        
+        // 验证登录的端点也需要特殊处理（允许无凭据时返回401而不是重定向）
+        const isVerifyEndpoint = req.path === '/admin_api/verify-login';
+        
+        if (publicPaths.includes(req.path)) {
+            return next(); // 直接放行登录页面相关资源
+        }
+        // ========== 新增结束 ==========
+
         let clientIp = req.ip;
         if (clientIp && clientIp.substr(0, 7) === "::ffff:") {
             clientIp = clientIp.substr(7);
@@ -264,8 +369,36 @@ const adminAuth = (req, res, next) => {
             });
         }
 
-        // 3. 凭据已配置，继续进行 Basic Auth
-        const credentials = basicAuth(req);
+        // 3. 尝试获取凭据（优先 Header，其次 Cookie）
+        let credentials = basicAuth(req);
+        
+        // 如果 Header 中没有凭据，尝试从 Cookie 中读取
+        if (!credentials && req.headers.cookie) {
+            const cookies = req.headers.cookie.split(';').reduce((acc, cookie) => {
+                const [key, value] = cookie.trim().split('=');
+                acc[key] = value;
+                return acc;
+            }, {});
+            
+            if (cookies.admin_auth) {
+                try {
+                    // Cookie 存储的是 "Basic xxxx" 格式
+                    const authValue = decodeURIComponent(cookies.admin_auth);
+                    if (authValue.startsWith('Basic ')) {
+                        const base64Credentials = authValue.substring(6);
+                        const decodedCredentials = Buffer.from(base64Credentials, 'base64').toString('utf8');
+                        const [name, pass] = decodedCredentials.split(':');
+                        if (name && pass) {
+                            credentials = { name, pass };
+                        }
+                    }
+                } catch (e) {
+                    console.warn('[AdminAuth] Failed to parse auth cookie:', e.message);
+                }
+            }
+        }
+
+        // 4. 验证凭据
         if (!credentials || credentials.name !== ADMIN_USERNAME || credentials.pass !== ADMIN_PASSWORD) {
             // 认证失败，处理登录尝试计数
             if (clientIp) {
@@ -289,12 +422,23 @@ const adminAuth = (req, res, next) => {
                 }
             }
             
-            res.setHeader('WWW-Authenticate', 'Basic realm="Admin Panel"');
-            if (req.path.startsWith('/admin_api') || (req.headers.accept && req.headers.accept.includes('application/json'))) {
+            // ========== 修改：根据请求类型决定响应方式 ==========
+            // API 请求或验证端点：返回 401 JSON
+            if (isVerifyEndpoint || req.path.startsWith('/admin_api') ||
+                (req.headers.accept && req.headers.accept.includes('application/json'))) {
+                // 不设置 WWW-Authenticate 头，避免触发浏览器弹窗
                 return res.status(401).json({ error: 'Unauthorized' });
-            } else {
+            }
+            // AdminPanel 页面请求：重定向到登录页面
+            else if (req.path.startsWith('/AdminPanel')) {
+                return res.redirect('/AdminPanel/login.html');
+            }
+            // 其他情况
+            else {
+                res.setHeader('WWW-Authenticate', 'Basic realm="Admin Panel"');
                 return res.status(401).send('<h1>401 Unauthorized</h1><p>Authentication required to access the Admin Panel.</p>');
             }
+            // ========== 修改结束 ==========
         }
         
         // 4. 认证成功
@@ -432,21 +576,9 @@ const VCP_TIMED_CONTACTS_DIR = path.join(__dirname, 'VCPTimedContacts');
 
 // 辅助函数：将 Date 对象格式化为包含时区偏移的本地时间字符串 (e.g., 2025-06-29T15:00:00+08:00)
 function formatToLocalDateTimeWithOffset(date) {
-    const pad = (num) => num.toString().padStart(2, '0');
-
-    const year = date.getFullYear();
-    const month = pad(date.getMonth() + 1);
-    const day = pad(date.getDate());
-    const hours = pad(date.getHours());
-    const minutes = pad(date.getMinutes());
-    const seconds = pad(date.getSeconds());
-
-    const tzOffset = -date.getTimezoneOffset();
-    const offsetHours = pad(Math.floor(Math.abs(tzOffset) / 60));
-    const offsetMinutes = pad(Math.abs(tzOffset) % 60);
-    const offsetSign = tzOffset >= 0 ? '+' : '-';
-
-    return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}${offsetSign}${offsetHours}:${offsetMinutes}`;
+    // 使用 dayjs 在配置的时区中解析 Date 对象，并格式化为 ISO 8601 扩展格式
+    // 'YYYY-MM-DDTHH:mm:ssZ' 格式会包含时区偏移
+    return dayjs(date).tz(DEFAULT_TIMEZONE).format('YYYY-MM-DDTHH:mm:ssZ');
 }
 
 app.post('/v1/schedule_task', async (req, res) => {
@@ -510,8 +642,101 @@ app.post('/v1/interrupt', (req, res) => {
     const context = activeRequests.get(id);
     if (context) {
         console.log(`[Interrupt] Received stop signal for ID: ${id}`);
-        context.abortController.abort(); // 触发中止
-        // The actual response handling is done in the handleChatCompletion's error handler
+        
+        // 修复 Bug #1, #2, #3: 先设置中止标志，再触发 abort，最后才尝试写入
+        // 1. 设置中止标志，防止 chatCompletionHandler 继续写入
+        if (!context.aborted) {
+            context.aborted = true; // 标记为已中止
+            
+            // 2. 立即触发 abort 信号（中断正在进行的 fetch 请求）
+            if (context.abortController && !context.abortController.signal.aborted) {
+                context.abortController.abort();
+                console.log(`[Interrupt] AbortController.abort() called for ID: ${id}`);
+            }
+            
+            // 3. 等待一小段时间让 abort 传播（避免竞态条件）
+            setImmediate(() => {
+                // 4. 现在安全地尝试关闭响应流（如果还未关闭）
+                if (context.res && !context.res.writableEnded && !context.res.destroyed) {
+                    try {
+                        // 检查响应头是否已发送，决定如何关闭
+                        if (!context.res.headersSent) {
+                            // 修复竞态条件Bug: 根据原始请求的stream属性判断响应类型
+                            const isStreamRequest = context.req?.body?.stream === true;
+                            
+                            if (isStreamRequest) {
+                                // 流式请求：发送SSE格式的中止信号
+                                console.log(`[Interrupt] Sending SSE abort signal for stream request ${id}`);
+                                context.res.status(200);
+                                context.res.setHeader('Content-Type', 'text/event-stream');
+                                context.res.setHeader('Cache-Control', 'no-cache');
+                                context.res.setHeader('Connection', 'keep-alive');
+                                
+                                const abortChunk = {
+                                    id: `chatcmpl-interrupt-${Date.now()}`,
+                                    object: 'chat.completion.chunk',
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: context.req?.body?.model || 'unknown',
+                                    choices: [{
+                                        index: 0,
+                                        delta: { content: '请求已被用户中止' },
+                                        finish_reason: 'stop'
+                                    }]
+                                };
+                                context.res.write(`data: ${JSON.stringify(abortChunk)}\n\n`);
+                                context.res.write('data: [DONE]\n\n');
+                                context.res.end();
+                            } else {
+                                // 非流式请求：发送标准JSON响应
+                                console.log(`[Interrupt] Sending JSON abort response for non-stream request ${id}`);
+                                context.res.status(200).json({
+                                    choices: [{
+                                        index: 0,
+                                        message: { role: 'assistant', content: '请求已被用户中止' },
+                                        finish_reason: 'stop'
+                                    }]
+                                });
+                            }
+                        } else if (context.res.getHeader('Content-Type')?.includes('text/event-stream')) {
+                            // 是流式响应，发送 [DONE] 信号并关闭
+                            context.res.write('data: [DONE]\n\n');
+                            context.res.end();
+                            console.log(`[Interrupt] Sent [DONE] signal and closed stream for ID: ${id}`);
+                        } else {
+                            // 其他情况，直接结束响应
+                            context.res.end();
+                            console.log(`[Interrupt] Ended response for ID: ${id}`);
+                        }
+                    } catch (e) {
+                        console.error(`[Interrupt] Error closing response for ${id}:`, e.message);
+                        // 即使写入失败也不要崩溃，只记录错误
+                        // 尝试强制关闭连接以防止挂起
+                        try {
+                            if (context.res && !context.res.destroyed) {
+                                context.res.destroy();
+                                console.log(`[Interrupt] Forcefully destroyed response for ${id}`);
+                            }
+                        } catch (destroyError) {
+                            console.error(`[Interrupt] Error destroying response for ${id}:`, destroyError.message);
+                        }
+                    }
+                } else {
+                    console.log(`[Interrupt] Response for ${id} already closed or destroyed.`);
+                }
+            });
+        } else {
+            console.log(`[Interrupt] Request ${id} already aborted, skipping duplicate abort.`);
+        }
+        
+        // 最后从 activeRequests 中移除，防止内存泄漏
+        setTimeout(() => {
+            if (activeRequests.has(id)) {
+                activeRequests.delete(id);
+                console.log(`[Interrupt] Cleaned up request ${id} from activeRequests`);
+            }
+        }, 1000); // 延迟1秒删除，确保所有异步操作完成
+        
+        // 向中断请求的发起者返回成功响应
         res.status(200).json({ status: 'success', message: `Interrupt signal sent for request ${id}.` });
     } else {
         console.log(`[Interrupt] Received stop signal for non-existent or completed ID: ${id}`);
@@ -533,23 +758,58 @@ const chatCompletionHandler = new ChatCompletionHandler({
     DEBUG_MODE,
     SHOW_VCP_OUTPUT,
     VCPToolCode, // 新增：传递VCP工具调用验证码开关
+    RAGMemoRefresh: RAG_MEMO_REFRESH, // 新增：传递RAG日记刷新开关
+    enableRoleDivider: ENABLE_ROLE_DIVIDER, // 新增：传递角色分割开关
+    enableRoleDividerInLoop: ENABLE_ROLE_DIVIDER_IN_LOOP, // 新增：传递循环栈角色分割开关
+    roleDividerIgnoreList: ROLE_DIVIDER_IGNORE_LIST, // 新增：传递角色分割忽略列表
+    roleDividerSwitches: {
+        system: ROLE_DIVIDER_SYSTEM,
+        assistant: ROLE_DIVIDER_ASSISTANT,
+        user: ROLE_DIVIDER_USER
+    },
+    roleDividerScanSwitches: {
+        system: ROLE_DIVIDER_SCAN_SYSTEM,
+        assistant: ROLE_DIVIDER_SCAN_ASSISTANT,
+        user: ROLE_DIVIDER_SCAN_USER
+    },
+    roleDividerRemoveDisabledTags: ROLE_DIVIDER_REMOVE_DISABLED_TAGS,
     maxVCPLoopStream: parseInt(process.env.MaxVCPLoopStream),
     maxVCPLoopNonStream: parseInt(process.env.MaxVCPLoopNonStream),
     apiRetries: parseInt(process.env.ApiRetries) || 3, // 新增：API重试次数
     apiRetryDelay: parseInt(process.env.ApiRetryDelay) || 1000, // 新增：API重试延迟
     cachedEmojiLists,
     detectors,
-    superDetectors
+    superDetectors,
+    chinaModel1: CHINA_MODEL_1,
+    chinaModel1Cot: CHINA_MODEL_1_COT
 });
 
 // Route for standard chat completions. VCP info is shown based on the .env config.
-app.post('/v1/chat/completions', (req, res) => {
-    chatCompletionHandler.handle(req, res, false);
+app.post('/v1/chat/completions', async (req, res) => {
+    try {
+        await chatCompletionHandler.handle(req, res, false);
+    } catch (e) {
+        console.error(`[FATAL] Uncaught exception from chatCompletionHandler for ${req.path}:`, e);
+        if (!res.headersSent) {
+            res.status(500).json({ error: "A fatal internal error occurred." });
+        } else if (!res.writableEnded) {
+            res.end();
+        }
+    }
 });
 
 // Route to force VCP info to be shown, regardless of the .env config.
-app.post('/v1/chatvcp/completions', (req, res) => {
-    chatCompletionHandler.handle(req, res, true);
+app.post('/v1/chatvcp/completions', async (req, res) => {
+    try {
+        await chatCompletionHandler.handle(req, res, true);
+    } catch (e) {
+        console.error(`[FATAL] Uncaught exception from chatCompletionHandler for ${req.path}:`, e);
+        if (!res.headersSent) {
+            res.status(500).json({ error: "A fatal internal error occurred." });
+        } else if (!res.writableEnded) {
+            res.end();
+        }
+    }
 });
 
 // 新增：人类直接调用工具的端点
@@ -738,7 +998,7 @@ async function handleDiaryFromAIResponse(responseText) {
 
 // Define dailyNoteRootPath here as it's needed by the adminPanelRoutes module
 // and was previously defined within the moved block.
-const dailyNoteRootPath = path.join(__dirname, 'dailynote');
+const dailyNoteRootPath = process.env.KNOWLEDGEBASE_ROOT_PATH || path.join(__dirname, 'dailynote');
 
 // Import and use the admin panel routes, passing the getter for currentServerLogPath
 const adminPanelRoutes = require('./routes/adminPanelRoutes')(
@@ -746,8 +1006,12 @@ const adminPanelRoutes = require('./routes/adminPanelRoutes')(
     dailyNoteRootPath,
     pluginManager,
     logger.getServerLogPath, // Pass the getter function
-    vectorDBManager // Pass the vectorDBManager instance
+    knowledgeBaseManager, // Pass the knowledgeBaseManager instance
+    AGENT_DIR // Pass the Agent directory path
 );
+
+// 新增：引入 VCP 论坛 API 路由
+const forumApiRoutes = require('./routes/forumApi');
 
 // --- End Admin API Router ---
 
@@ -811,10 +1075,11 @@ app.post('/plugin-callback/:pluginName/:taskId', async (req, res) => {
 
 async function initialize() {
     console.log('开始初始化向量数据库...');
-    await vectorDBManager.initialize(); // 在加载插件之前启动，确保服务就绪
+    await knowledgeBaseManager.initialize(); // 在加载插件之前启动，确保服务就绪
     console.log('向量数据库初始化完成。');
 
     pluginManager.setProjectBasePath(__dirname);
+    pluginManager.setVectorDBManager(knowledgeBaseManager); // 注入 knowledgeBaseManager
     
     console.log('开始加载插件...');
     await pluginManager.loadPlugins();
@@ -829,13 +1094,15 @@ async function initialize() {
     await pluginManager.initializeServices(app, adminPanelRoutes, __dirname);
     // 在所有服务插件都注册完路由后，再将 adminApiRouter 挂载到主 app 上
     app.use('/admin_api', adminPanelRoutes);
-    console.log('服务类插件初始化完成，管理面板 API 路由已挂载。');
+    // 挂载 VCP 论坛 API 路由
+    app.use('/admin_api/forum', forumApiRoutes);
+    console.log('服务类插件初始化完成，管理面板 API 路由和 VCP 论坛 API 路由已挂载。');
 
     // --- 新增：通用依赖注入 ---
     // 在所有服务都初始化完毕后，再执行依赖注入，确保 VCPLog 等服务已准备就绪。
     try {
         const dependencies = {
-            vectorDBManager,
+            knowledgeBaseManager,
             vcpLogFunctions: pluginManager.getVCPLogFunctions()
         };
         if (DEBUG_MODE) console.log('[Server] Injecting dependencies into plugins...');
@@ -908,10 +1175,11 @@ async function initialize() {
 // Store the server instance globally so it can be accessed by gracefulShutdown
 let server;
 
-server = app.listen(port, async () => { // Assign to server variable
+async function startServer() {
     await loadBlacklist(); // 新增：在服务器启动时加载IP黑名单
-    console.log(`中间层服务器正在监听端口 ${port}`);
-    console.log(`API 服务器地址: ${apiUrl}`);
+    
+    // 确保 Agent 目录存在
+    await ensureAgentDirectory();
     
     // 新增：加载模型重定向配置
     console.log('正在加载模型重定向配置...');
@@ -919,11 +1187,9 @@ server = app.listen(port, async () => { // Assign to server variable
     await modelRedirectHandler.loadModelRedirectConfig(path.join(__dirname, 'ModelRedirect.json'));
     console.log('模型重定向配置加载完成。');
     
-    // ensureDebugLogDir() is effectively handled by initializeServerLogger() synchronously earlier.
-    // If ensureDebugLogDirAsync was meant for other purposes, it can be called where needed.
-    
     // 新增：初始化Agent管理器
     console.log('正在初始化Agent管理器...');
+    agentManager.setAgentDir(AGENT_DIR);
     await agentManager.initialize(DEBUG_MODE);
     console.log('Agent管理器初始化完成。');
 
@@ -931,23 +1197,31 @@ server = app.listen(port, async () => { // Assign to server variable
     tvsManager.initialize(DEBUG_MODE);
     console.log('TVS管理器初始化完成。');
 
+    // 🌟 关键修复：在监听端口前完成所有初始化
     await initialize(); // This loads plugins and initializes services
 
-    // Initialize the new WebSocketServer
-    if (DEBUG_MODE) console.log('[Server] Initializing WebSocketServer...');
-    const vcpKeyValue = pluginManager.getResolvedPluginConfigValue('VCPLog', 'VCP_Key') || process.env.VCP_Key;
-    webSocketServer.initialize(server, { debugMode: DEBUG_MODE, vcpKey: vcpKeyValue });
-    
-    // --- 注入依赖 ---
-    // pluginManager.setWebSocketServer(webSocketServer); // 已移动到 initializeServices 之前
-    webSocketServer.setPluginManager(pluginManager);
-    
-    // 初始化 FileFetcherServer
-    FileFetcherServer.initialize(webSocketServer);
+    server = app.listen(port, () => {
+        console.log(`中间层服务器正在监听端口 ${port}`);
+        console.log(`API 服务器地址: ${apiUrl}`);
 
-    if (DEBUG_MODE) console.log('[Server] WebSocketServer, PluginManager, and FileFetcherServer have been interconnected.');
+        // Initialize the new WebSocketServer
+        if (DEBUG_MODE) console.log('[Server] Initializing WebSocketServer...');
+        const vcpKeyValue = pluginManager.getResolvedPluginConfigValue('VCPLog', 'VCP_Key') || process.env.VCP_Key;
+        webSocketServer.initialize(server, { debugMode: DEBUG_MODE, vcpKey: vcpKeyValue });
+        
+        // --- 注入依赖 ---
+        webSocketServer.setPluginManager(pluginManager);
+        
+        // 初始化 FileFetcherServer
+        FileFetcherServer.initialize(webSocketServer);
 
-    // The VCPLog plugin's attachWebSocketServer is no longer needed here as WebSocketServer handles it.
+        if (DEBUG_MODE) console.log('[Server] WebSocketServer, PluginManager, and FileFetcherServer have been interconnected.');
+    });
+}
+
+startServer().catch(err => {
+    console.error('[Server] Failed to start server:', err);
+    process.exit(1);
 });
 
 
@@ -970,7 +1244,7 @@ async function gracefulShutdown() {
     if (serverLogWriteStream) {
         logger.originalConsoleLog('[Server] Closing server log file stream...');
         const logClosePromise = new Promise((resolve) => {
-            serverLogWriteStream.end(`[${new Date().toLocaleString()}] Server gracefully shut down.\n`, () => {
+            serverLogWriteStream.end(`[${dayjs().tz(DEFAULT_TIMEZONE).format('YYYY-MM-DD HH:mm:ss Z')}] Server gracefully shut down.\n`, () => {
                 logger.originalConsoleLog('[Server] Server log stream closed.');
                 resolve();
             });
@@ -985,6 +1259,45 @@ async function gracefulShutdown() {
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 
+// 新增：捕获未处理的异常，防止服务器崩溃
+process.on('uncaughtException', (error) => {
+    console.error('[CRITICAL] Uncaught Exception detected:', error.message);
+    console.error('[CRITICAL] Stack trace:', error.stack);
+    
+    // 记录到日志文件
+    const serverLogWriteStream = logger.getLogWriteStream();
+    if (serverLogWriteStream && !serverLogWriteStream.destroyed) {
+        try {
+            serverLogWriteStream.write(
+                `[${dayjs().tz(DEFAULT_TIMEZONE).format('YYYY-MM-DD HH:mm:ss Z')}] [CRITICAL] Uncaught Exception: ${error.message}\n${error.stack}\n`
+            );
+        } catch (e) {
+            console.error('[CRITICAL] Failed to write exception to log:', e.message);
+        }
+    }
+    
+    // 不要立即退出，让服务器继续运行
+    console.log('[CRITICAL] Server will continue running despite the exception.');
+});
+
+// 新增：捕获未处理的 Promise 拒绝
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[WARNING] Unhandled Promise Rejection at:', promise);
+    console.error('[WARNING] Reason:', reason);
+    
+    // 记录到日志文件
+    const serverLogWriteStream = logger.getLogWriteStream();
+    if (serverLogWriteStream && !serverLogWriteStream.destroyed) {
+        try {
+            serverLogWriteStream.write(
+                `[${dayjs().tz(DEFAULT_TIMEZONE).format('YYYY-MM-DD HH:mm:ss Z')}] [WARNING] Unhandled Promise Rejection: ${reason}\n`
+            );
+        } catch (e) {
+            console.error('[WARNING] Failed to write rejection to log:', e.message);
+        }
+    }
+});
+
 // Ensure log stream is flushed on uncaught exceptions or synchronous exit, though less reliable
 process.on('exit', (code) => {
     logger.originalConsoleLog(`[Server] Exiting with code ${code}.`);
@@ -992,7 +1305,7 @@ process.on('exit', (code) => {
     const currentServerLogPath = logger.getServerLogPath();
     if (serverLogWriteStream && !serverLogWriteStream.destroyed) {
         try {
-            fsSync.appendFileSync(currentServerLogPath, `[${new Date().toLocaleString()}] Server exited with code ${code}.\n`);
+            fsSync.appendFileSync(currentServerLogPath, `[${dayjs().tz(DEFAULT_TIMEZONE).format('YYYY-MM-DD HH:mm:ss Z')}] Server exited with code ${code}.\n`);
             serverLogWriteStream.end();
         } catch (e) {
             logger.originalConsoleError('[Server] Error during final log write on exit:', e.message);

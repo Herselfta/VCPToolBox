@@ -19,14 +19,28 @@ function extractReadableText(pluginResult) {
         return pluginResult;
     }
     if (typeof pluginResult === 'object') {
-        // 1. 优先处理多模态 content 数组
-        if (Array.isArray(pluginResult.content)) {
-            const textParts = pluginResult.content
-                .filter(part => part.type === 'text' && part.text)
+        // 辅助函数：从数组中提取文本内容
+        const extractFromContentArray = (arr) => {
+            if (!Array.isArray(arr)) return null;
+            const textParts = arr
+                .filter(part => part && part.type === 'text' && typeof part.text === 'string')
                 .map(part => part.text);
-            if (textParts.length > 0) {
-                return textParts.join('\n');
-            }
+            return textParts.length > 0 ? textParts.join('\n') : null;
+        };
+
+        // 1. 尝试从各种可能的路径提取文本内容
+        // 路径 A: 直接在 content 数组中
+        let text = extractFromContentArray(pluginResult.content);
+        if (text) return text;
+
+        // 路径 B: 直接在 result 数组中
+        text = extractFromContentArray(pluginResult.result);
+        if (text) return text;
+
+        // 路径 C: 在 result.content 数组中 (处理某些嵌套返回)
+        if (pluginResult.result && typeof pluginResult.result === 'object') {
+            text = extractFromContentArray(pluginResult.result.content);
+            if (text) return text;
         }
 
         // 2. 其次按优先级查找常见的纯文本结果字段
@@ -56,8 +70,17 @@ function extractReadableText(pluginResult) {
 
         if (typeof pluginResult.content === 'string') return pluginResult.content;
 
-        // 4. 最后的备用方案：返回一个单行的JSON字符串
-        return JSON.stringify(pluginResult);
+        // 4. 最后的备用方案：返回 JSON 字符串，但使用 replacer 过滤掉 Base64 数据
+        try {
+            return JSON.stringify(pluginResult, (key, value) => {
+                if (typeof value === 'string' && (value.includes(';base64,') || value.startsWith('data:image/'))) {
+                    return `[Base64 Data Ignored] (Length: ${value.length})`;
+                }
+                return value;
+            });
+        } catch (e) {
+            return JSON.stringify(pluginResult).substring(0, 1000) + '... [JSON解析失败或过长已截断]';
+        }
     }
     return `插件返回了未知类型的数据。`;
 }
@@ -78,7 +101,7 @@ function formatVcpInfoToText(toolName, status, pluginResult) {
 - 工具名称: ${toolName}
 - 执行状态: ${statusIcon} ${status.toUpperCase()}
 - 返回内容: ${readableContent}
-]]`;
+VCP调用结果结束]]`;
 
     // 在前后添加换行符，使其在聊天流中作为独立的块出现
     return `\n${textBlock}\n`;
@@ -92,9 +115,16 @@ function formatVcpInfoToText(toolName, status, pluginResult) {
  * @param {string} toolName - 调用的工具名称。
  * @param {string} status - 调用状态 ('success' 或 'error')。
  * @param {any} pluginResult - 插件返回的原始结果。
+ * @param {AbortController} abortController - 可选的中止控制器，用于检查请求是否已被中止。
  * @returns {string} - 格式化后的 VCP 信息文本。
  */
-function streamVcpInfo(responseStream, modelName, toolName, status, pluginResult) {
+function streamVcpInfo(responseStream, modelName, toolName, status, pluginResult, abortController = null) {
+    // 新增：检查中止信号，如果请求已被中止，则跳过写入
+    if (abortController && abortController.signal && abortController.signal.aborted) {
+        // 请求已中止，直接返回空字符串，不执行任何写入操作
+        return '';
+    }
+    
     const formattedText = formatVcpInfoToText(toolName, status, pluginResult);
 
     // If a responseStream is provided and it's writable, send the data as an SSE chunk.

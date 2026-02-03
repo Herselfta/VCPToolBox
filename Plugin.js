@@ -27,11 +27,17 @@ class PluginManager {
         this.webSocketServer = null; // 为 WebSocketServer 实例占位
         this.isReloading = false;
         this.reloadTimeout = null;
+        this.vectorDBManager = null; // 修复：不再自己创建，等待注入
     }
 
     setWebSocketServer(wss) {
         this.webSocketServer = wss;
         if (this.debugMode) console.log('[PluginManager] WebSocketServer instance has been set.');
+    }
+
+    setVectorDBManager(vdbManager) {
+        this.vectorDBManager = vdbManager;
+        if (this.debugMode) console.log('[PluginManager] VectorDBManager instance has been set.');
     }
 
     async _getDecryptedAuthCode() {
@@ -54,20 +60,24 @@ class PluginManager {
 
     _getPluginConfig(pluginManifest) {
         const config = {};
-        const globalEnv = process.env; 
-        const pluginSpecificEnv = pluginManifest.pluginSpecificEnvConfig || {}; 
+        const globalEnv = process.env;
+        const pluginSpecificEnv = pluginManifest.pluginSpecificEnvConfig || {};
 
         if (pluginManifest.configSchema) {
             for (const key in pluginManifest.configSchema) {
-                const expectedType = pluginManifest.configSchema[key];
+                const schemaEntry = pluginManifest.configSchema[key];
+                // 兼容两种格式：对象格式 { type: "string", ... } 和简单字符串格式 "string"
+                const expectedType = (typeof schemaEntry === 'object' && schemaEntry !== null)
+                    ? schemaEntry.type
+                    : schemaEntry;
                 let rawValue;
 
-                if (pluginSpecificEnv.hasOwnProperty(key)) { 
+                if (pluginSpecificEnv.hasOwnProperty(key)) {
                     rawValue = pluginSpecificEnv[key];
-                } else if (globalEnv.hasOwnProperty(key)) { 
+                } else if (globalEnv.hasOwnProperty(key)) {
                     rawValue = globalEnv[key];
                 } else {
-                    continue; 
+                    continue;
                 }
 
                 let value = rawValue;
@@ -127,13 +137,14 @@ class PluginManager {
             let output = '';
             let errorOutput = '';
             let processExited = false;
-            const timeoutDuration = plugin.communication?.timeout || 30000;
+            const timeoutDuration = plugin.communication?.timeout || 60000; // 增加默认超时时间到 1 分钟
 
             const timeoutId = setTimeout(() => {
                 if (!processExited) {
-                    console.error(`[PluginManager] Static plugin "${plugin.name}" execution timed out after ${timeoutDuration}ms.`); // Keep error
+                    console.log(`[PluginManager] Static plugin "${plugin.name}" has completed its work cycle (${timeoutDuration}ms), terminating background process.`);
                     pluginProcess.kill('SIGKILL');
-                    reject(new Error(`Static plugin "${plugin.name}" execution timed out.`));
+                    // 超时不作为错误 - static 插件完成工作周期后返回已收集的输出
+                    resolve(output.trim());
                 }
             }, timeoutDuration);
 
@@ -150,7 +161,8 @@ class PluginManager {
             pluginProcess.on('exit', (code, signal) => {
                 processExited = true;
                 clearTimeout(timeoutId);
-                if (signal === 'SIGKILL') { 
+                if (signal === 'SIGKILL') {
+                    // 被 SIGKILL 终止（超时），已经在 timeout 回调中 resolve 了，这里直接返回
                     return;
                 }
                 if (code !== 0) {
@@ -181,23 +193,24 @@ class PluginManager {
         if (plugin.capabilities && plugin.capabilities.systemPromptPlaceholders) {
             plugin.capabilities.systemPromptPlaceholders.forEach(ph => {
                 const placeholderKey = ph.placeholder;
-                const currentValue = this.staticPlaceholderValues.get(placeholderKey);
+                const currentValueEntry = this.staticPlaceholderValues.get(placeholderKey);
+                const currentValue = currentValueEntry ? currentValueEntry.value : undefined;
 
                 if (newValue !== null && newValue.trim() !== "") {
-                    this.staticPlaceholderValues.set(placeholderKey, newValue.trim());
+                    this.staticPlaceholderValues.set(placeholderKey, { value: newValue.trim(), serverId: 'local' });
                     if (this.debugMode) console.log(`[PluginManager] Placeholder ${placeholderKey} for ${plugin.name} updated with value: "${(newValue.trim()).substring(0,70)}..."`);
                 } else if (executionError) {
                     const errorMessage = `[Error updating ${plugin.name}: ${executionError.message.substring(0,100)}...]`;
                     if (!currentValue || (currentValue && currentValue.startsWith("[Error"))) {
-                        this.staticPlaceholderValues.set(placeholderKey, errorMessage);
+                        this.staticPlaceholderValues.set(placeholderKey, { value: errorMessage, serverId: 'local' });
                         if (this.debugMode) console.warn(`[PluginManager] Placeholder ${placeholderKey} for ${plugin.name} set to error state: ${errorMessage}`);
                     } else {
                         if (this.debugMode) console.warn(`[PluginManager] Placeholder ${placeholderKey} for ${plugin.name} failed to update. Keeping stale value: "${(currentValue || "").substring(0,70)}..."`);
                     }
                 } else {
                     if (this.debugMode) console.warn(`[PluginManager] Static plugin ${plugin.name} produced no new output for ${placeholderKey}. Keeping stale value (if any).`);
-                    if (!this.staticPlaceholderValues.has(placeholderKey)) {
-                        this.staticPlaceholderValues.set(placeholderKey, `[${plugin.name} data currently unavailable]`);
+                    if (!currentValueEntry) {
+                        this.staticPlaceholderValues.set(placeholderKey, { value: `[${plugin.name} data currently unavailable]`, serverId: 'local' });
                         if (this.debugMode) console.log(`[PluginManager] Placeholder ${placeholderKey} for ${plugin.name} set to 'unavailable'.`);
                     }
                 }
@@ -212,7 +225,7 @@ class PluginManager {
                 // Immediately set a "loading" state for the placeholder.
                 if (plugin.capabilities && plugin.capabilities.systemPromptPlaceholders) {
                     plugin.capabilities.systemPromptPlaceholders.forEach(ph => {
-                        this.staticPlaceholderValues.set(ph.placeholder, `[${plugin.displayName} a-zheng-zai-jia-zai-zhong... ]`);
+                        this.staticPlaceholderValues.set(ph.placeholder, { value: `[${plugin.displayName} a-zheng-zai-jia-zai-zhong... ]`, serverId: 'local' });
                     });
                 }
 
@@ -280,7 +293,32 @@ class PluginManager {
     
     
     getPlaceholderValue(placeholder) {
-        return this.staticPlaceholderValues.get(placeholder) || `[Placeholder ${placeholder} not found]`;
+        // First, try the modern, clean key (e.g., "VCPChromePageInfo")
+        let entry = this.staticPlaceholderValues.get(placeholder);
+
+        // If not found, try the legacy key with brackets (e.g., "{{VCPChromePageInfo}}")
+        if (entry === undefined) {
+            entry = this.staticPlaceholderValues.get(`{{${placeholder}}}`);
+        }
+
+        // If still not found, return the "not found" message
+        if (entry === undefined) {
+            return `[Placeholder ${placeholder} not found]`;
+        }
+
+        // Now, handle the value format
+        // Modern format: { value: "...", serverId: "..." }
+        if (typeof entry === 'object' && entry !== null && entry.hasOwnProperty('value')) {
+            return entry.value;
+        }
+        
+        // Legacy format: raw string
+        if (typeof entry === 'string') {
+            return entry;
+        }
+
+        // Fallback for unexpected formats
+        return `[Invalid value format for placeholder ${placeholder}]`;
     }
 
     async executeMessagePreprocessor(pluginName, messages) {
@@ -308,6 +346,17 @@ class PluginManager {
     
     async shutdownAllPlugins() {
         console.log('[PluginManager] Shutting down all plugins...'); // Keep
+
+        // --- Shutdown VectorDBManager first to stop background processing ---
+        if (this.vectorDBManager && typeof this.vectorDBManager.shutdown === 'function') {
+            try {
+                if (this.debugMode) console.log('[PluginManager] Calling shutdown for VectorDBManager...');
+                await this.vectorDBManager.shutdown();
+            } catch (error) {
+                console.error('[PluginManager] Error during shutdown of VectorDBManager:', error);
+            }
+        }
+
         for (const [name, pluginModuleData] of this.messagePreprocessors) {
              const pluginModule = pluginModuleData.module || pluginModuleData;
             if (pluginModule && typeof pluginModule.shutdown === 'function') {
@@ -338,20 +387,45 @@ class PluginManager {
 
     async loadPlugins() {
         console.log('[PluginManager] Starting plugin discovery...');
-        const localPlugins = new Map();
+        // 1. 清理现有插件状态
+        // 1.1 识别并关闭本地插件，保留分布式插件
+        const distributedPlugins = new Map();
+        const localModulesToShutdown = new Set();
+
         for (const [name, manifest] of this.plugins.entries()) {
-            if (!manifest.isDistributed) {
-                localPlugins.set(name, manifest);
+            if (manifest.isDistributed) {
+                distributedPlugins.set(name, manifest);
+            } else {
+                // 收集本地插件模块以进行清理
+                const preprocessor = this.messagePreprocessors.get(name);
+                if (preprocessor) localModulesToShutdown.add(preprocessor);
+                
+                const service = this.serviceModules.get(name)?.module;
+                if (service) localModulesToShutdown.add(service);
             }
         }
-        this.plugins = localPlugins;
+
+        // 执行清理：在重新加载前关闭旧的本地插件实例，释放资源
+        for (const module of localModulesToShutdown) {
+            if (typeof module.shutdown === 'function') {
+                try {
+                    module.shutdown();
+                } catch (e) {
+                    console.error(`[PluginManager] Error during hot-reload shutdown of a plugin:`, e.message);
+                }
+            }
+        }
+
+        this.plugins = distributedPlugins; // 仅保留分布式插件，本地插件将被重新发现
         this.messagePreprocessors.clear();
         this.staticPlaceholderValues.clear();
         this.serviceModules.clear();
 
         const discoveredPreprocessors = new Map();
+        const modulesToInitialize = [];
 
         try {
+            // 2. 发现并加载所有插件模块，但不初始化
             const pluginFolders = await fs.readdir(PLUGIN_DIR, { withFileTypes: true });
             for (const folder of pluginFolders) {
                 if (folder.isDirectory()) {
@@ -378,34 +452,21 @@ class PluginManager {
                         const isPreprocessor = manifest.pluginType === 'messagePreprocessor' || manifest.pluginType === 'hybridservice';
                         const isService = manifest.pluginType === 'service' || manifest.pluginType === 'hybridservice';
 
-                        if (isPreprocessor || isService) {
-                            if (manifest.entryPoint.script && manifest.communication?.protocol === 'direct') {
-                                try {
-                                    const scriptPath = path.join(pluginPath, manifest.entryPoint.script);
-                                    const module = require(scriptPath);
-                                    const initialConfig = this._getPluginConfig(manifest);
-                                    
-                                    // Manually inject essential server configs for service modules
-                                    initialConfig.PORT = process.env.PORT;
-                                    initialConfig.Key = process.env.Key;
-                                    initialConfig.PROJECT_BASE_PATH = this.projectBasePath;
+                        if ((isPreprocessor || isService) && manifest.entryPoint.script && manifest.communication?.protocol === 'direct') {
+                            try {
+                                const scriptPath = path.join(pluginPath, manifest.entryPoint.script);
+                                const module = require(scriptPath);
+                                
+                                modulesToInitialize.push({ manifest, module });
 
-                                    if (typeof module.initialize === 'function') {
-                                        const dependencies = {
-                                            vcpLogFunctions: this.getVCPLogFunctions()
-                                        };
-                                        await module.initialize(initialConfig, dependencies);
-                                    }
-                                    if (isPreprocessor && typeof module.processMessages === 'function') {
-                                        discoveredPreprocessors.set(manifest.name, module);
-                                    }
-                                    // For both service and hybridservice, store the module for direct calls or routing.
-                                    if (isService) {
-                                        this.serviceModules.set(manifest.name, { manifest, module });
-                                    }
-                                } catch (e) {
-                                    console.error(`[PluginManager] Error loading module for ${manifest.name}:`, e);
+                                if (isPreprocessor && typeof module.processMessages === 'function') {
+                                    discoveredPreprocessors.set(manifest.name, module);
                                 }
+                                if (isService) {
+                                    this.serviceModules.set(manifest.name, { manifest, module });
+                                }
+                            } catch (e) {
+                                console.error(`[PluginManager] Error loading module for ${manifest.name}:`, e);
                             }
                         }
                     } catch (error) {
@@ -416,52 +477,83 @@ class PluginManager {
                 }
             }
 
-            // --- 新的排序和注册逻辑 ---
+            // 3. 确定预处理器加载顺序
             const availablePlugins = new Set(discoveredPreprocessors.keys());
             let finalOrder = [];
-            let orderFileExists = false;
             try {
-                await fs.access(PREPROCESSOR_ORDER_FILE);
-                orderFileExists = true;
-            } catch (error) {
-                // File does not exist, which is fine.
-            }
-
-            if (orderFileExists) {
-                try {
-                    const orderContent = await fs.readFile(PREPROCESSOR_ORDER_FILE, 'utf-8');
-                    const savedOrder = JSON.parse(orderContent);
-                    if (Array.isArray(savedOrder)) {
-                        for (const pluginName of savedOrder) {
-                            if (availablePlugins.has(pluginName)) {
-                                finalOrder.push(pluginName);
-                                availablePlugins.delete(pluginName);
-                            }
+                const orderContent = await fs.readFile(PREPROCESSOR_ORDER_FILE, 'utf-8');
+                const savedOrder = JSON.parse(orderContent);
+                if (Array.isArray(savedOrder)) {
+                    savedOrder.forEach(pluginName => {
+                        if (availablePlugins.has(pluginName)) {
+                            finalOrder.push(pluginName);
+                            availablePlugins.delete(pluginName);
                         }
-                    }
-                } catch (error) {
-                    console.error(`[PluginManager] Error reading existing ${PREPROCESSOR_ORDER_FILE}:`, error);
+                    });
                 }
+            } catch (error) {
+                if (error.code !== 'ENOENT') console.error(`[PluginManager] Error reading existing ${PREPROCESSOR_ORDER_FILE}:`, error);
             }
             
-            finalOrder.push(...Array.from(availablePlugins).sort()); // 将新发现的插件按字母顺序追加
+            finalOrder.push(...Array.from(availablePlugins).sort());
             
-            // 如果文件最初不存在，并且我们确定了最终顺序，则创建它
-            if (!orderFileExists && finalOrder.length > 0) {
-                try {
-                    await fs.writeFile(PREPROCESSOR_ORDER_FILE, JSON.stringify(finalOrder, null, 2), 'utf-8');
-                    console.log(`[PluginManager] Initialized ${PREPROCESSOR_ORDER_FILE} with default order.`);
-                } catch (writeError) {
-                    console.error(`[PluginManager] Failed to create initial ${PREPROCESSOR_ORDER_FILE}:`, writeError);
-                }
-            }
-
+            // 4. 注册预处理器
             for (const pluginName of finalOrder) {
                 this.messagePreprocessors.set(pluginName, discoveredPreprocessors.get(pluginName));
             }
             this.preprocessorOrder = finalOrder;
             if (finalOrder.length > 0) console.log('[PluginManager] Final message preprocessor order: ' + finalOrder.join(' -> '));
-            // --- 排序逻辑结束 ---
+
+            // 5. VectorDBManager 应该已经由 server.js 初始化，这里不再重复初始化
+            if (!this.vectorDBManager) {
+                console.warn('[PluginManager] VectorDBManager not set! Plugins requiring it may fail.');
+            }
+
+            // 6. 按顺序初始化所有模块
+            const allModulesMap = new Map(modulesToInitialize.map(m => [m.manifest.name, m]));
+            const initializationOrder = [...this.preprocessorOrder];
+            allModulesMap.forEach((_, name) => {
+                if (!initializationOrder.includes(name)) {
+                    initializationOrder.push(name);
+                }
+            });
+
+            for (const pluginName of initializationOrder) {
+                const item = allModulesMap.get(pluginName);
+                if (!item || typeof item.module.initialize !== 'function') continue;
+
+                const { manifest, module } = item;
+                try {
+                    const initialConfig = this._getPluginConfig(manifest);
+                    initialConfig.PORT = process.env.PORT;
+                    initialConfig.Key = process.env.Key;
+                    initialConfig.PROJECT_BASE_PATH = this.projectBasePath;
+
+                    const dependencies = { vcpLogFunctions: this.getVCPLogFunctions() };
+
+                    // --- 注入 VectorDBManager ---
+                    if (manifest.name === 'RAGDiaryPlugin') {
+                        dependencies.vectorDBManager = this.vectorDBManager;
+                    }
+
+                    // --- LightMemo 特殊依赖注入 ---
+                    if (manifest.name === 'LightMemo') {
+                        const ragPluginModule = this.messagePreprocessors.get('RAGDiaryPlugin');
+                        if (ragPluginModule && ragPluginModule.vectorDBManager && typeof ragPluginModule.getSingleEmbedding === 'function') {
+                            dependencies.vectorDBManager = ragPluginModule.vectorDBManager;
+                            dependencies.getSingleEmbedding = ragPluginModule.getSingleEmbedding.bind(ragPluginModule);
+                            if (this.debugMode) console.log(`[PluginManager] Injected VectorDBManager and getSingleEmbedding into LightMemo.`);
+                        } else {
+                            console.error(`[PluginManager] Critical dependency failure: RAGDiaryPlugin or its components not available for LightMemo injection.`);
+                        }
+                    }
+                    // --- 注入结束 ---
+
+                    await module.initialize(initialConfig, dependencies);
+                } catch (e) {
+                    console.error(`[PluginManager] Error initializing module for ${manifest.name}:`, e);
+                }
+            }
 
             this.buildVCPDescription();
             console.log(`[PluginManager] Plugin discovery finished. Loaded ${this.plugins.size} plugins.`);
@@ -592,11 +684,13 @@ class PluginManager {
                // --- 混合服务插件直接调用逻辑 ---
                if (this.debugMode) console.log(`[PluginManager] Processing direct tool call for hybrid service: ${toolName}`);
                const serviceModule = this.getServiceModule(toolName);
-               if (serviceModule && typeof serviceModule.processToolCall === 'function') {
-                   resultFromPlugin = await serviceModule.processToolCall(pluginSpecificArgs);
-               } else {
+               if (!serviceModule) {
+                   throw new Error(`[PluginManager] Hybrid service plugin "${toolName}" module not found. It may have failed to load or initialize during hot-reload.`);
+               }
+               if (typeof serviceModule.processToolCall !== 'function') {
                    throw new Error(`[PluginManager] Hybrid service plugin "${toolName}" does not have a processToolCall function.`);
                }
+               resultFromPlugin = await serviceModule.processToolCall(pluginSpecificArgs);
             } else {
                 // --- 本地插件调用逻辑 (现有逻辑) ---
                 if (!((plugin.pluginType === 'synchronous' || plugin.pluginType === 'asynchronous') && plugin.communication?.protocol === 'stdio')) {
@@ -1048,8 +1142,7 @@ class PluginManager {
         
         for (const [placeholder, value] of Object.entries(placeholders)) {
             // 为分布式占位符添加服务器来源标识
-            const distributedKey = `${placeholder}@@${serverId}`;
-            this.staticPlaceholderValues.set(placeholder, value);
+            this.staticPlaceholderValues.set(placeholder, { value: value, serverId: serverId });
             
             if (this.debugMode) {
                 console.log(`[PluginManager] Updated distributed placeholder ${placeholder} from ${serverName}: ${value.substring(0, 100)}${value.length > 100 ? '...' : ''}`);
@@ -1064,12 +1157,8 @@ class PluginManager {
     clearDistributedStaticPlaceholders(serverId) {
         const placeholdersToRemove = [];
         
-        for (const [placeholder, value] of this.staticPlaceholderValues.entries()) {
-            // 查找属于该服务器的占位符（基于某种标识）
-            // 由于我们没有直接的映射关系，这里我们可以选择保守策略
-            // 仅在明确知道是分布式占位符时才删除
-            const distributedKey = `${placeholder}@@${serverId}`;
-            if (this.staticPlaceholderValues.has(distributedKey)) {
+        for (const [placeholder, entry] of this.staticPlaceholderValues.entries()) {
+            if (entry && entry.serverId === serverId) {
                 placeholdersToRemove.push(placeholder);
             }
         }
@@ -1143,9 +1232,26 @@ class PluginManager {
 
         this.reloadTimeout = setTimeout(async () => {
             this.isReloading = true;
-            console.log(`[PluginManager] Manifest file change detected ('${eventType}'). Hot-reloading plugins...`);
             
             try {
+                // --- 精细化检查：判断是否需要触发重载 ---
+                if (eventType !== 'unlink') {
+                    try {
+                        const content = await fs.readFile(filePath, 'utf-8');
+                        const manifest = JSON.parse(content);
+                        
+                        // 如果是常驻内存型插件（direct 协议），禁止自动热重载以维持稳定性
+                        if (manifest.communication?.protocol === 'direct') {
+                            if (this.debugMode) console.log(`[PluginManager] Resident plugin manifest change detected (${manifest.name}), skipping auto-reload to maintain stability.`);
+                            this.isReloading = false;
+                            return;
+                        }
+                    } catch (e) {
+                        // 如果读取或解析失败，保守起见继续执行重载
+                    }
+                }
+
+                console.log(`[PluginManager] Manifest file change detected ('${eventType}'). Hot-reloading plugins...`);
                 await this.loadPlugins();
                 console.log('[PluginManager] Hot-reload complete.');
 
@@ -1166,4 +1272,29 @@ class PluginManager {
 }
 
 const pluginManager = new PluginManager();
+
+// 新增：获取所有静态占位符值
+pluginManager.getAllPlaceholderValues = function() {
+    const valuesMap = new Map();
+    for (const [key, entry] of this.staticPlaceholderValues.entries()) {
+        // Sanitize the key to remove legacy brackets for consistency
+        const sanitizedKey = key.replace(/^{{|}}$/g, '');
+        
+        let value;
+        // Handle modern object format
+        if (typeof entry === 'object' && entry !== null && entry.hasOwnProperty('value')) {
+            value = entry.value;
+        // Handle legacy raw string format
+        } else if (typeof entry === 'string') {
+            value = entry;
+        } else {
+            // Fallback for any other unexpected format
+            value = `[Invalid format for placeholder ${sanitizedKey}]`;
+        }
+        
+        valuesMap.set(sanitizedKey, value || `[Placeholder ${sanitizedKey} has no value]`);
+    }
+    return valuesMap;
+};
+
 module.exports = pluginManager;
