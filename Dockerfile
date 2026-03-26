@@ -25,7 +25,10 @@ RUN apk add --no-cache \
   python3-dev \
   linux-headers \
   libffi-dev \
-  openssl-dev
+  openssl-dev \
+  ffmpeg \
+  rust \
+  cargo
 
 # 在 npm install 之前设置环境变量，跳过 puppeteer 的 chromium 下载
 ARG PUPPETEER_SKIP_DOWNLOAD=true
@@ -46,6 +49,7 @@ RUN npm cache clean --force && npm install --registry=https://registry.npmmirror
 COPY requirements.txt ./
 # 在 Linux 环境下构建时，注释掉仅适用于 Windows 的 win10toast 包
 RUN sed -i '/^win10toast/s/^/#/' requirements.txt
+RUN python3 -m pip install --no-cache-dir --break-system-packages -U pip setuptools wheel -i https://pypi.tuna.tsinghua.edu.cn/simple
 RUN pip3 install --no-cache-dir --break-system-packages --target=/usr/src/app/pydeps -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
 # 复制所有源代码
@@ -95,8 +99,8 @@ RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
   jpeg-dev \
   zlib-dev \
   freetype-dev \
-  libffi
-
+  libffi \
+ffmpeg
 # 设置 PYTHONPATH 环境变量，让 Python 能找到我们安装的依赖
 ENV PYTHONPATH=/usr/src/app/pydeps
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser

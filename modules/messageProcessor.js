@@ -7,8 +7,28 @@ const tvsManager = require('./tvsManager.js'); // 引入新的TVS管理器
 
 const DEFAULT_TIMEZONE = process.env.DEFAULT_TIMEZONE || 'Asia/Shanghai';
 const REPORT_TIMEZONE = process.env.REPORT_TIMEZONE || 'Asia/Shanghai'; // 新增：用于控制 AI 报告的时间，默认回退到中国时区
-const AGENT_DIR = path.join(__dirname, '..', 'Agent');
-const TVS_DIR = path.join(__dirname, '..', 'TVStxt');
+function resolveAgentDir() {
+    const configPath = process.env.AGENT_DIR_PATH;
+    if (!configPath || typeof configPath !== 'string' || configPath.trim() === '') {
+        return path.join(__dirname, '..', 'Agent');
+    }
+    const normalizedPath = path.normalize(configPath.trim());
+    return path.isAbsolute(normalizedPath)
+        ? normalizedPath
+        : path.resolve(__dirname, '..', normalizedPath);
+}
+const AGENT_DIR = resolveAgentDir();
+function resolveTvsDir() {
+    const configPath = process.env.TVSTXT_DIR_PATH;
+    if (!configPath || typeof configPath !== 'string' || configPath.trim() === '') {
+        return path.join(__dirname, '..', 'TVStxt');
+    }
+    const normalizedPath = path.normalize(configPath.trim());
+    return path.isAbsolute(normalizedPath)
+        ? normalizedPath
+        : path.resolve(__dirname, '..', normalizedPath);
+}
+const TVS_DIR = resolveTvsDir();
 const VCP_ASYNC_RESULTS_DIR = path.join(__dirname, '..', 'VCPAsyncResults');
 
 async function resolveAllVariables(text, model, role, context, processingStack = new Set()) {
@@ -18,7 +38,7 @@ async function resolveAllVariables(text, model, role, context, processingStack =
     // 通用正则表达式，匹配所有 {{...}} 格式的占位符
     const placeholderRegex = /\{\{([a-zA-Z0-9_:]+)\}\}/g;
     const matches = [...processedText.matchAll(placeholderRegex)];
-    
+
     // 提取所有潜在的别名（去除 "agent:" 前缀）
     const allAliases = new Set(matches.map(match => match[1].replace(/^agent:/, '')));
 
@@ -33,7 +53,7 @@ async function resolveAllVariables(text, model, role, context, processingStack =
             }
 
             const agentContent = await agentManager.getAgentPrompt(alias);
-            
+
             processingStack.add(alias);
             const resolvedAgentContent = await resolveAllVariables(agentContent, model, role, context, processingStack);
             processingStack.delete(alias);
@@ -49,6 +69,143 @@ async function resolveAllVariables(text, model, role, context, processingStack =
     processedText = await replaceOtherVariables(processedText, model, role, context);
 
     return processedText;
+}
+
+// 🌟 新增：动态折叠协议处理器
+async function resolveDynamicFoldProtocol(foldObj, context, placeholderKey) {
+    if (!foldObj || !foldObj.vcp_dynamic_fold || !Array.isArray(foldObj.fold_blocks) || foldObj.fold_blocks.length === 0) {
+        return `[无效的动态折叠数据结构: ${placeholderKey}]`;
+    }
+
+    // 按阈值降序排序 (0.7, 0.5, 0.0)
+    const blocks = [...foldObj.fold_blocks].sort((a, b) => b.threshold - a.threshold);
+    // 最低阈值区块作为后备 (Fallback)
+    const fallbackBlock = blocks[blocks.length - 1];
+
+    try {
+        const ragPlugin = context.pluginManager.messagePreprocessors?.get('RAGDiaryPlugin');
+        if (!ragPlugin || typeof ragPlugin.getSingleEmbeddingCached !== 'function') {
+            if (context.DEBUG_MODE) console.log(`[DynamicFold] RAGDiaryPlugin 不可用，返回基础内容 (${placeholderKey})`);
+            return fallbackBlock.content;
+        }
+
+        // 提取最后一个 User 和 AI 的消息作为核心比对内容 (原子级复刻 RAGDiaryPlugin 逻辑以命中向量缓存)
+        const contextMessages = context.messages || [];
+
+        const lastUserMessageIndex = contextMessages.findLastIndex(m => {
+            if (m.role !== 'user') return false;
+            const content = typeof m.content === 'string'
+                ? m.content
+                : (Array.isArray(m.content) ? (m.content.find(p => p.type === 'text')?.text || '') : '');
+            return !content.startsWith('[系统邀请指令:]') && !content.trim().startsWith('[系统提示:]无内容');
+        });
+        const lastAiMessageIndex = contextMessages.findLastIndex(m => m.role === 'assistant');
+
+        let userContent = '';
+        let aiContent = null;
+
+        if (lastUserMessageIndex > -1) {
+            const m = contextMessages[lastUserMessageIndex];
+            userContent = typeof m.content === 'string'
+                ? m.content
+                : (Array.isArray(m.content) ? (m.content.find(p => p.type === 'text')?.text || '') : '');
+        }
+
+        if (lastAiMessageIndex > -1) {
+            const m = contextMessages[lastAiMessageIndex];
+            aiContent = typeof m.content === 'string'
+                ? m.content
+                : (Array.isArray(m.content) ? (m.content.find(p => p.type === 'text')?.text || '') : '');
+        }
+
+        if (!userContent) {
+            if (context.DEBUG_MODE) console.log(`[DynamicFold] 未找到 User 文本消息，返回基础内容 (${placeholderKey})`);
+            return fallbackBlock.content;
+        }
+
+        // 调用 RAGDiaryPlugin 的清理方法，确保文本与 RAG 插件完全一致 (命中缓存的关键)
+        if (typeof ragPlugin._stripSystemNotification === 'function') {
+            if (userContent) {
+                const originalUserContent = userContent;
+                userContent = ragPlugin._stripSystemNotification(userContent);
+                userContent = ragPlugin._stripHtml(userContent);
+                userContent = ragPlugin._stripEmoji(userContent);
+                userContent = ragPlugin._stripToolMarkers(userContent);
+                if (context.DEBUG_MODE && originalUserContent.length !== userContent.length) {
+                    console.log('[DynamicFold] User content was sanitized (SystemNotification + HTML + Emoji removed).');
+                }
+            }
+        }
+        if (aiContent && typeof ragPlugin._stripHtml === 'function') {
+            const originalAiContent = aiContent;
+            aiContent = ragPlugin._stripHtml(aiContent);
+            aiContent = ragPlugin._stripEmoji(aiContent);
+            aiContent = ragPlugin._stripToolMarkers(aiContent);
+            if (context.DEBUG_MODE && originalAiContent.length !== aiContent.length) {
+                console.log('[DynamicFold] AI content was sanitized (HTML + Emoji removed).');
+            }
+        }
+
+        const combinedQueryForDisplay = aiContent
+            ? `[AI]: ${aiContent}\n[User]: ${userContent}`
+            : userContent;
+
+        // 获取当前会话上下文向量 (此时将完美命中 RAGDiaryPlugin 的 embeddingCache)
+        const userVector = await ragPlugin.getSingleEmbeddingCached(combinedQueryForDisplay);
+        if (!userVector) {
+            if (context.DEBUG_MODE) console.log(`[DynamicFold] 获取用户上下文向量失败，返回基础内容 (${placeholderKey})`);
+            return fallbackBlock.content;
+        }
+
+        // 计算插件描述向量 (使用 KBM 的 SQLite 持久化缓存)
+        const descText = foldObj.plugin_description || placeholderKey;
+        let descVector = null;
+        if (ragPlugin.vectorDBManager && typeof ragPlugin.vectorDBManager.getPluginDescriptionVector === 'function') {
+            descVector = await ragPlugin.vectorDBManager.getPluginDescriptionVector(
+                descText,
+                // 必须绑定 this 到 ragPlugin 避免上下文丢失
+                ragPlugin.getSingleEmbeddingCached.bind(ragPlugin)
+            );
+        } else {
+            // 后备：没有 SQLite 时使用自带内存缓存
+            descVector = await ragPlugin.getSingleEmbeddingCached(descText);
+        }
+
+        if (!descVector) {
+            if (context.DEBUG_MODE) console.log(`[DynamicFold] 获取插件描述向量失败，返回基础内容 (${placeholderKey})`);
+            return fallbackBlock.content;
+        }
+
+        // 计算余弦相似度
+        let dotProduct = 0;
+        let normA = 0;
+        let normB = 0;
+        const len = Math.min(descVector.length, userVector.length);
+        for (let i = 0; i < len; i++) {
+            dotProduct += descVector[i] * userVector[i];
+            normA += descVector[i] * descVector[i];
+            normB += userVector[i] * userVector[i];
+        }
+        const sim = (normA === 0 || normB === 0) ? 0 : dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+
+        if (context.DEBUG_MODE) {
+            console.log(`[DynamicFold] ${placeholderKey} 上下文相似度: ${sim.toFixed(3)} (目标区块数: ${blocks.length})`);
+        }
+
+        // 匹配折叠阈值
+        for (const block of blocks) {
+            if (sim >= block.threshold) {
+                if (context.DEBUG_MODE) console.log(`[DynamicFold] ${placeholderKey} 命中阈值 >= ${block.threshold}，展开相关内容。`);
+                return block.content;
+            }
+        }
+
+        return fallbackBlock.content;
+    } catch (e) {
+        console.error(`[DynamicFold] 处理动态折叠时发生异常 (${placeholderKey}):`, e.message);
+        // 如果出错或者拿不到索引，安全回退到最精简内容
+        return fallbackBlock.content;
+    }
 }
 
 async function replaceOtherVariables(text, model, role, context) {
@@ -95,7 +252,7 @@ async function replaceOtherVariables(text, model, role, context) {
                     replacementText = promptValue;
                 }
             }
-            
+
             // 对当前文本中所有匹配的占位符进行替换
             const placeholderRegExp = new RegExp(placeholder.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'g');
             processedText = processedText.replace(placeholderRegExp, replacementText);
@@ -145,13 +302,28 @@ async function replaceOtherVariables(text, model, role, context) {
         let festivalInfo = `${yearName}${lunarDate.zodiac}年${lunarDate.dateStr}`;
         if (lunarDate.solarTerm) festivalInfo += ` ${lunarDate.solarTerm}`;
         processedText = processedText.replace(/\{\{Festival\}\}/g, festivalInfo);
-        
+
         const staticPlaceholderValues = pluginManager.getAllPlaceholderValues(); // Use the getter
         if (staticPlaceholderValues && staticPlaceholderValues.size > 0) {
-            for (const [placeholder, value] of staticPlaceholderValues.entries()) {
+            for (const [placeholder, entry] of staticPlaceholderValues.entries()) {
+                // 修复上下文折叠漏洞：如果当前文本压根没有这个占位符，直接跳过，避免触发不必要的向量化和计算
+                if (!processedText.includes(placeholder)) {
+                    continue;
+                }
+
                 const placeholderRegex = new RegExp(placeholder.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'g');
-                // The getter now returns the correct string value
-                processedText = processedText.replace(placeholderRegex, value || `[${placeholder} 信息不可用]`);
+
+                let valueToInject = entry;
+                if (typeof entry === 'object' && entry !== null && entry.hasOwnProperty('value')) {
+                    valueToInject = entry.value;
+                }
+
+                // 支持 vcp_dynamic_fold 协议
+                if (typeof valueToInject === 'object' && valueToInject !== null && valueToInject.vcp_dynamic_fold) {
+                    valueToInject = await resolveDynamicFoldProtocol(valueToInject, context, placeholder);
+                }
+
+                processedText = processedText.replace(placeholderRegex, valueToInject || `[${placeholder} 信息不可用]`);
             }
         }
 
@@ -188,7 +360,7 @@ async function replaceOtherVariables(text, model, role, context) {
             }
         }
     }
-    
+
     for (const rule of superDetectors) {
         if (typeof rule.detector === 'string' && rule.detector.length > 0 && typeof rule.output === 'string') {
             processedText = processedText.replaceAll(rule.detector, rule.output);
@@ -204,7 +376,7 @@ async function replaceOtherVariables(text, model, role, context) {
         const placeholder = asyncMatch[0];
         const pluginName = asyncMatch[1];
         const requestId = asyncMatch[2];
-        
+
         promises.push(
             (async () => {
                 const resultFilePath = path.join(VCP_ASYNC_RESULTS_DIR, `${pluginName}-${requestId}.json`);
@@ -215,7 +387,7 @@ async function replaceOtherVariables(text, model, role, context) {
                     if (callbackData && callbackData.message) {
                         replacementText = callbackData.message;
                     } else if (callbackData && callbackData.status === 'Succeed') {
-                         replacementText = `任务 ${pluginName} (ID: ${requestId}) 已成功完成。详情: ${JSON.stringify(callbackData.data || callbackData.result || callbackData)}`;
+                        replacementText = `任务 ${pluginName} (ID: ${requestId}) 已成功完成。详情: ${JSON.stringify(callbackData.data || callbackData.result || callbackData)}`;
                     } else if (callbackData && callbackData.status === 'Failed') {
                         replacementText = `任务 ${pluginName} (ID: ${requestId}) 处理失败。原因: ${callbackData.reason || JSON.stringify(callbackData.data || callbackData.error || callbackData)}`;
                     }
@@ -231,7 +403,7 @@ async function replaceOtherVariables(text, model, role, context) {
             })()
         );
     }
-    
+
     await Promise.all(promises);
     processedText = tempAsyncProcessedText;
 
@@ -258,40 +430,8 @@ async function replacePriorityVariables(text, context, role) {
         processedText = processedText.replaceAll(placeholder, emojiList || `[${emojiName}列表不可用]`);
     }
 
-    // --- 日记本处理 (已修复循环风险) ---
-    const diaryPlaceholderRegex = /\{\{([^{}]+?)日记本\}\}/g;
-    let allDiariesData = {};
-    const allDiariesDataString = pluginManager.getPlaceholderValue("{{AllCharacterDiariesData}}");
-
-    if (allDiariesDataString && !allDiariesDataString.startsWith("[Placeholder")) {
-        try {
-            allDiariesData = JSON.parse(allDiariesDataString);
-        } catch (e) {
-            console.error(`[replacePriorityVariables] Failed to parse AllCharacterDiariesData JSON: ${e.message}. Data: ${allDiariesDataString.substring(0, 100)}...`);
-        }
-    } else if (allDiariesDataString && allDiariesDataString.startsWith("[Placeholder")) {
-        if (DEBUG_MODE) console.warn(`[replacePriorityVariables] Placeholder {{AllCharacterDiariesData}} not found or not yet populated. Value: ${allDiariesDataString}`);
-    }
-
-    // Step 1: Find all unique diary placeholders in the original text to avoid loops.
-    const matches = [...processedText.matchAll(diaryPlaceholderRegex)];
-    const uniquePlaceholders = [...new Set(matches.map(match => match[0]))];
-
-    // Step 2: Iterate through the unique placeholders and replace them.
-    for (const placeholder of uniquePlaceholders) {
-        // Extract character name from placeholder like "{{小雨日记本}}" -> "小雨"
-        const characterNameMatch = placeholder.match(/\{\{([^{}]+?)日记本\}\}/);
-        if (characterNameMatch && characterNameMatch[1]) {
-            const characterName = characterNameMatch[1];
-            let diaryContent = `[${characterName}日记本内容为空或未从插件获取]`;
-            if (allDiariesData.hasOwnProperty(characterName)) {
-                diaryContent = allDiariesData[characterName];
-            }
-            // Replace all instances of this specific placeholder.
-            // This is safe because we are iterating over a pre-determined list, not re-scanning the string.
-            processedText = processedText.replaceAll(placeholder, diaryContent);
-        }
-    }
+    // --- 日记本处理 (迁移到 RAGDiaryPlugin) ---
+    // (逻辑已移除)
 
     return processedText;
 }

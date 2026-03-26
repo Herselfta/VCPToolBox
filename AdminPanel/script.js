@@ -14,6 +14,10 @@ import { initializeThinkingChainsEditor } from './js/thinking-chains-editor.js';
 import { initializeVCPForum } from './js/forum.js';
 import { initializeScheduleManager } from './js/schedule-manager.js';
 import { initializeRAGTuning } from './js/rag-tuning.js';
+import { initializeDreamManager } from './js/dream-manager.js';
+import { initializeAgentScores } from './js/agent-scores.js';
+import { initializePlaceholderViewer } from './js/placeholder-viewer.js';
+import { initializeToolApprovalManager } from './js/tool-approval.js';
 
 document.addEventListener('DOMContentLoaded', async () => {
     // 1. 通过后端验证登录状态（替代前端 Cookie 检查，解决 HttpOnly 无法读取问题）
@@ -85,7 +89,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         document.querySelectorAll('.config-section').forEach(section => {
             const isTarget = section.id === sectionIdToActivate;
             const iframe = section.querySelector('iframe');
-            
+
             if (isTarget) {
                 section.classList.add('active-section');
                 // 懒加载：进入时加载 iframe
@@ -124,6 +128,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     case 'agent-assistant-config-section':
                         initializeAgentAssistantConfig();
                         break;
+                    case 'agent-scores-section':
+                        initializeAgentScores();
+                        break;
                     case 'tvs-files-editor-section':
                         initializeTvsFilesEditor();
                         break;
@@ -148,10 +155,19 @@ document.addEventListener('DOMContentLoaded', async () => {
                     case 'rag-tuning-section':
                         initializeRAGTuning();
                         break;
+                    case 'dream-manager-section':
+                        initializeDreamManager();
+                        break;
+                    case 'placeholder-viewer-section':
+                        initializePlaceholderViewer();
+                        break;
+                    case 'tool-approval-manager-section':
+                        initializeToolApprovalManager();
+                        break;
                 }
             }
         } else {
-           console.warn(`[navigateTo] Target section with ID '${sectionIdToActivate}' not found.`);
+            console.warn(`[navigateTo] Target section with ID '${sectionIdToActivate}' not found.`);
         }
 
         // 强制重置主内容区域滚动条
@@ -182,7 +198,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     let inferredType = 'string';
                     if (/^(true|false)$/i.test(entry.value)) inferredType = 'boolean';
                     else if (!isNaN(parseFloat(entry.value)) && isFinite(entry.value) && !entry.value.includes('.')) inferredType = 'integer';
-                    
+
                     formGroup = createFormGroup(
                         entry.key, entry.value, inferredType,
                         `根目录 config.env 配置项: ${entry.key}`,
@@ -250,8 +266,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         categories.forEach(category => {
             let nextElement = category.nextElementSibling;
             let allHidden = true;
-            while(nextElement && !nextElement.classList.contains('nav-category')) {
-                if(nextElement.style.display !== 'none') {
+            while (nextElement && !nextElement.classList.contains('nav-category')) {
+                if (nextElement.style.display !== 'none') {
                     allHidden = false;
                     break;
                 }

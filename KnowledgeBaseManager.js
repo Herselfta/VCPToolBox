@@ -7,10 +7,11 @@ const path = require('path');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const chokidar = require('chokidar');
-const { chunkText } = require('./TextChunker'); 
+const { chunkText } = require('./TextChunker');
 const { getEmbeddingsBatch } = require('./EmbeddingUtils');
 const EPAModule = require('./EPAModule');
 const ResidualPyramid = require('./ResidualPyramid');
+const ResultDeduplicator = require('./ResultDeduplicator'); // ✅ Tagmemo v4 requirement
 
 // 尝试加载 Rust Vexus 引擎
 let VexusIndex = null;
@@ -33,12 +34,15 @@ class KnowledgeBaseManager {
             model: process.env.WhitelistEmbeddingModel || 'google/gemini-embedding-001',
             // ⚠️ 务必确认环境变量 VECTORDB_DIMENSION 与模型一致 (3-small通常为1536)
             dimension: parseInt(process.env.VECTORDB_DIMENSION) || 3072,
-            
+
             batchWindow: parseInt(process.env.KNOWLEDGEBASE_BATCH_WINDOW_MS, 10) || 2000,
             maxBatchSize: parseInt(process.env.KNOWLEDGEBASE_MAX_BATCH_SIZE, 10) || 50,
             indexSaveDelay: parseInt(process.env.KNOWLEDGEBASE_INDEX_SAVE_DELAY, 10) || 120000,
             tagIndexSaveDelay: parseInt(process.env.KNOWLEDGEBASE_TAG_INDEX_SAVE_DELAY, 10) || 300000,
-            
+            // 🌟 索引空闲自动卸载：默认 2 小时未使用则从内存中卸载
+            indexIdleTTL: parseInt(process.env.KNOWLEDGEBASE_INDEX_IDLE_TTL_MS, 10) || 2 * 60 * 60 * 1000,
+            indexIdleSweepInterval: parseInt(process.env.KNOWLEDGEBASE_INDEX_IDLE_SWEEP_MS, 10) || 10 * 60 * 1000,
+
             ignoreFolders: (process.env.IGNORE_FOLDERS || 'VCP论坛').split(',').map(f => f.trim()).filter(Boolean),
             ignorePrefixes: (process.env.IGNORE_PREFIXES || process.env.IGNORE_PREFIX || '已整理').split(',').map(p => p.trim()).filter(Boolean),
             ignoreSuffixes: (process.env.IGNORE_SUFFIXES || process.env.IGNORE_SUFFIX || '夜伽').split(',').map(s => s.trim()).filter(Boolean),
@@ -55,20 +59,28 @@ class KnowledgeBaseManager {
         };
 
         this.db = null;
-        this.diaryIndices = new Map(); 
+        this.diaryIndices = new Map();
+        this.diaryIndexLastUsed = new Map(); // 🌟 记录每个索引的最后使用时间
+        this.idleSweepTimer = null;
         this.tagIndex = null;
         this.watcher = null;
         this.initialized = false;
         this.diaryNameVectorCache = new Map();
         this.pendingFiles = new Set();
+        this.fileRetryCount = new Map(); // 🛡️ 文件重试计数器，防止无限循环
         this.batchTimer = null;
         this.isProcessing = false;
         this.saveTimers = new Map();
         this.tagCooccurrenceMatrix = null; // 优化1：Tag共现矩阵
         this.epa = null;
         this.residualPyramid = null;
+        this.resultDeduplicator = null; // ✅ Tagmemo v4
         this.ragParams = {}; // ✅ 新增：用于存储热调控参数
         this.ragParamsWatcher = null;
+
+        // 🌟 TagMemo V7.1: 矩阵计算防抖系统
+        this._accumulatedTagChanges = 0;
+        this._matrixRebuildTimer = null;
     }
 
     async initialize() {
@@ -83,7 +95,7 @@ class KnowledgeBaseManager {
         this.db.pragma('synchronous = NORMAL');
 
         this._initSchema();
-        
+
         // 1. 初始化全局 Tag 索引 (异步恢复)
         const tagIdxPath = path.join(this.config.storePath, 'index_global_tags.usearch');
         const tagCapacity = 50000;
@@ -101,27 +113,35 @@ class KnowledgeBaseManager {
             this.tagIndex = new VexusIndex(this.config.dimension, tagCapacity);
             this._recoverTagsAsync(); // Fire-and-forget
         }
-        
+
         // 2. 预热日记本名称向量缓存（同步阻塞，确保 RAG 插件启动即可用）
         this._hydrateDiaryNameCacheSync();
-        
+
         // 优化1：启动时构建共现矩阵
-        this._buildCooccurrenceMatrix();
+        this._buildDirectedCooccurrenceMatrix();
 
         // 初始化 EPA 和残差金字塔模块
         this.epa = new EPAModule(this.db, {
             dimension: this.config.dimension,
-            vexusIndex: this.tagIndex
+            vexusIndex: this.tagIndex,
+            nodeResidual: this.ragParams.KnowledgeBaseManager?.nodeResidualGain || 0.05,
         });
         await this.epa.initialize();
-        
+
         this.residualPyramid = new ResidualPyramid(this.tagIndex, this.db, {
+            dimension: this.config.dimension
+        });
+
+        // ✅ Tagmemo v4: 初始化结果去重器
+        this.resultDeduplicator = new ResultDeduplicator(this.db, {
             dimension: this.config.dimension
         });
 
         this._startWatcher();
         await this.loadRagParams();
         this._startRagParamsWatcher();
+        this._startIdleSweep(); // 🌟 启动空闲索引自动卸载
+        this._loadIntrinsicResiduals(); // TagMemo V7: 加载内生残差
 
         this.initialized = true;
         console.log('[KnowledgeBase] ✅ System Ready');
@@ -148,7 +168,7 @@ class KnowledgeBaseManager {
     _startRagParamsWatcher() {
         const paramsPath = path.join(__dirname, 'rag_params.json');
         if (this.ragParamsWatcher) return;
-        
+
         this.ragParamsWatcher = chokidar.watch(paramsPath);
         this.ragParamsWatcher.on('change', async () => {
             console.log('[KnowledgeBase] 🔄 检测到 rag_params.json 变更，正在重新加载...');
@@ -183,9 +203,16 @@ class KnowledgeBaseManager {
             CREATE TABLE IF NOT EXISTS file_tags (
                 file_id INTEGER NOT NULL,
                 tag_id INTEGER NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (file_id, tag_id),
                 FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
                 FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS tag_intrinsic_residuals (
+                tag_id INTEGER PRIMARY KEY,
+                residual_energy REAL NOT NULL,
+                neighbor_count INTEGER NOT NULL,
+                computed_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE TABLE IF NOT EXISTS kv_store (
                 key TEXT PRIMARY KEY,
@@ -196,11 +223,29 @@ class KnowledgeBaseManager {
             CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
             CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag_id);
             CREATE INDEX IF NOT EXISTS idx_file_tags_composite ON file_tags(tag_id, file_id);
+            
+            -- TagMemo V7: 检查并添加 position 列（针对现有数据库）
+            BEGIN;
+            SELECT CASE WHEN count(*) = 0 THEN 
+                'ALTER TABLE file_tags ADD COLUMN position INTEGER NOT NULL DEFAULT 0' 
+            ELSE 
+                'SELECT 1' 
+            END FROM pragma_table_info('file_tags') WHERE name='position';
+            COMMIT;
         `);
+        
+        // 🛠️ 核心修复：由于 db.exec 不支持动态执行 SELECT 返回的 SQL，我们手动补丁
+        try {
+            this.db.prepare("ALTER TABLE file_tags ADD COLUMN position INTEGER NOT NULL DEFAULT 0").run();
+        } catch (e) {
+            // 如果列已存在，SQLite 会报错，忽略即可
+        }
     }
 
     // 🏭 索引工厂
     async _getOrLoadDiaryIndex(diaryName) {
+        // 🌟 每次访问都刷新最后使用时间
+        this.diaryIndexLastUsed.set(diaryName, Date.now());
         if (this.diaryIndices.has(diaryName)) {
             return this.diaryIndices.get(diaryName);
         }
@@ -307,13 +352,13 @@ class KnowledgeBaseManager {
 
     async _searchSpecificIndex(diaryName, vector, k, tagBoost, coreTags = [], coreBoostFactor = 1.33) {
         const idx = await this._getOrLoadDiaryIndex(diaryName);
-        
+
         // 如果索引为空，直接返回
         // 注意：vexus-lite-js 可能没有 size() 方法，用 catch 捕获
         try {
             const stats = idx.stats ? idx.stats() : { totalVectors: 1 };
             if (stats.totalVectors === 0) return [];
-        } catch(e) {}
+        } catch (e) { }
 
         // 🛠️ 修复 1: 安全的 Buffer 转换
         let searchBuffer;
@@ -322,14 +367,14 @@ class KnowledgeBaseManager {
         try {
             let searchVecFloat;
             if (tagBoost > 0) {
-                // 🌟 TagMemo 逻辑回归：应用 Tag 增强 (强制使用 V3)
-                const boostResult = this._applyTagBoostV3(new Float32Array(vector), tagBoost, coreTags, coreBoostFactor);
+                // 🌟 TagMemo 逻辑回归：应用 Tag 增强 (强制使用 V6)
+                const boostResult = this._applyTagBoostV6(new Float32Array(vector), tagBoost, coreTags, coreBoostFactor);
                 searchVecFloat = boostResult.vector;
                 tagInfo = boostResult.info;
             } else {
                 searchVecFloat = new Float32Array(vector);
             }
-            
+
             // ⚠️ 维度检查
             if (searchVecFloat.length !== this.config.dimension) {
                 console.error(`[KnowledgeBase] Dimension mismatch! Expected ${this.config.dimension}, got ${searchVecFloat.length}`);
@@ -383,17 +428,17 @@ class KnowledgeBaseManager {
         let tagInfo = null;
 
         if (tagBoost > 0) {
-            const boostResult = this._applyTagBoostV3(new Float32Array(vector), tagBoost, coreTags, coreBoostFactor);
+            const boostResult = this._applyTagBoostV6(new Float32Array(vector), tagBoost, coreTags, coreBoostFactor);
             searchVecFloat = boostResult.vector;
             tagInfo = boostResult.info;
         } else {
             searchVecFloat = new Float32Array(vector);
         }
-        
+
         const searchBuffer = Buffer.from(searchVecFloat.buffer, searchVecFloat.byteOffset, searchVecFloat.byteLength);
 
         const allDiaries = this.db.prepare('SELECT DISTINCT diary_name FROM files').all();
-        
+
         const searchPromises = allDiaries.map(async ({ diary_name }) => {
             try {
                 const idx = await this._getOrLoadDiaryIndex(diary_name);
@@ -408,9 +453,9 @@ class KnowledgeBaseManager {
 
         const resultsPerIndex = await Promise.all(searchPromises);
         let allResults = resultsPerIndex.flat();
-        
+
         allResults.sort((a, b) => b.score - a.score);
-        
+
         const topK = allResults.slice(0, k);
 
         const hydrate = this.db.prepare(`
@@ -434,10 +479,10 @@ class KnowledgeBaseManager {
     }
 
     /**
-     * 🌟 TagMemo V3.7 + EPA + Residual Pyramid + Worldview Gating 增强版
+     * 🌟 TagMemo 浪潮 + EPA + Residual Pyramid + Worldview Gating + LIF Spike Propagation (V6)
      */
-    _applyTagBoostV3(vector, baseTagBoost, coreTags = [], coreBoostFactor = 1.33) {
-        const debug = true;
+    _applyTagBoostV6(vector, baseTagBoost, coreTags = [], coreBoostFactor = 1.33) {
+        const debug = false;
         const originalFloat32 = vector instanceof Float32Array ? vector : new Float32Array(vector);
         const dim = originalFloat32.length;
 
@@ -456,12 +501,12 @@ class KnowledgeBaseManager {
             const logicDepth = epaResult.logicDepth;        // 0~1, 高=逻辑聚焦
             const entropyPenalty = epaResult.entropy;       // 0~1, 高=信息散乱
             const resonanceBoost = Math.log(1 + resonance.resonance);
-            
+
             // 核心公式：结合 EPA 和残差特征
             const actRange = config.activationMultiplier || [0.5, 1.5];
             const activationMultiplier = actRange[0] + features.tagMemoActivation * (actRange[1] - actRange[0]);
             const dynamicBoostFactor = (logicDepth * (1 + resonanceBoost) / (1 + entropyPenalty * 0.5)) * activationMultiplier;
-            
+
             const boostRange = config.dynamicBoostRange || [0.3, 2.0];
             const effectiveTagBoost = baseTagBoost * Math.max(boostRange[0], Math.min(boostRange[1], dynamicBoostFactor));
 
@@ -471,30 +516,46 @@ class KnowledgeBaseManager {
             const coreMetric = (logicDepth * 0.5) + ((1 - features.coverage) * 0.5);
             const coreRange = config.coreBoostRange || [1.20, 1.40];
             const dynamicCoreBoostFactor = coreRange[0] + (coreMetric * (coreRange[1] - coreRange[0]));
-            
+
             if (debug) {
-                console.log(`[TagMemo-V3.7] World=${queryWorld}, Depth=${logicDepth.toFixed(3)}, Resonance=${resonance.resonance.toFixed(3)}`);
-                console.log(`[TagMemo-V3.7] Coverage=${features.coverage.toFixed(3)}, Explained=${(pyramid.totalExplainedEnergy * 100).toFixed(1)}%`);
-                console.log(`[TagMemo-V3.7] Effective Boost: ${effectiveTagBoost.toFixed(3)}, Dynamic Core Boost: ${dynamicCoreBoostFactor.toFixed(3)}`);
+                console.log(`[TagMemo-V6] World=${queryWorld}, Depth=${logicDepth.toFixed(3)}, Resonance=${resonance.resonance.toFixed(3)}`);
+                console.log(`[TagMemo-V6] Coverage=${features.coverage.toFixed(3)}, Explained=${(pyramid.totalExplainedEnergy * 100).toFixed(1)}%`);
+                console.log(`[TagMemo-V6] Effective Boost: ${effectiveTagBoost.toFixed(3)}, Dynamic Core Boost: ${dynamicCoreBoostFactor.toFixed(3)}`);
             }
 
             // [4] 收集金字塔中的所有 Tags 并应用“世界观门控”与“语言补偿”
             const allTags = [];
             const seenTagIds = new Set();
-            // 安全处理 coreTags，过滤非字符串
-            const safeCoreTags = Array.isArray(coreTags) ? coreTags.filter(t => typeof t === 'string') : [];
-            const coreTagSet = new Set(safeCoreTags.map(t => t.toLowerCase()));
-            
+
+            // 🌟 莱恩的鲁棒分流法：鸭子类型分离输入参数
+            const coreTagStrings = [];
+            const hardGhostObjects = [];
+            const softGhostObjects = [];
+
+            if (Array.isArray(coreTags)) {
+                coreTags.forEach(t => {
+                    if (typeof t === 'string') {
+                        coreTagStrings.push(t.toLowerCase());
+                    } else if (t && t.name && t.vector) {
+                        // 如果带有向量，说明是幽灵对象，按 isCore 再次分流
+                        if (t.isCore) hardGhostObjects.push(t);
+                        else softGhostObjects.push(t);
+                    }
+                });
+            }
+            // 这个 Set 只管原生的字符串补全逻辑
+            const coreTagSet = new Set(coreTagStrings);
+
             // 🛡️ 防御性检查：确保 pyramid.levels 存在且为数组
             const levels = Array.isArray(pyramid.levels) ? pyramid.levels : [];
 
             levels.forEach(level => {
                 // 🛡️ 防御性检查：确保 level.tags 存在且为数组
                 const tags = Array.isArray(level.tags) ? level.tags : [];
-                
+
                 tags.forEach(t => {
                     if (!t || seenTagIds.has(t.id)) return;
-                    
+
                     // 🌟 核心 Tag 增强逻辑 (Spotlight)
                     // 安全访问 t.name
                     const tagName = t.name ? t.name.toLowerCase() : '';
@@ -512,7 +573,7 @@ class KnowledgeBaseManager {
                         const tName = t.name || '';
                         const isTechnicalNoise = !/[\u4e00-\u9fa5]/.test(tName) && /^[A-Za-z0-9\-_.\s]+$/.test(tName) && tName.length > 3;
                         const isTechnicalWorld = queryWorld !== 'Unknown' && /^[A-Za-z0-9\-_.]+$/.test(queryWorld);
-                        
+
                         if (isTechnicalNoise && !isTechnicalWorld) {
                             // 🌟 阶梯式语言补偿：不再一刀切
                             // 如果是政治/社会世界观，减轻对英文实体的压制（可能是 Trump, Musk 等重要实体）
@@ -530,7 +591,7 @@ class KnowledgeBaseManager {
                     // 简单实现：如果 Tag 本身有向量，检查其与查询世界的正交性
                     // 这里暂用 layerDecay 代替复杂的实时投影以保证性能
                     const layerDecay = Math.pow(0.7, level.level);
-                    
+
                     allTags.push({
                         ...t,
                         adjustedWeight: (t.contribution || t.weight || 0) * layerDecay * langPenalty * coreBoost,
@@ -540,32 +601,106 @@ class KnowledgeBaseManager {
                 });
             });
 
-            // [4.5] 逻辑分支拉回 (Logic Pull-back)
-            // 利用共现矩阵拉回与第一梯队 Tag 强相关的逻辑词
+            // [4.5] 仿脑认知扩散 (Spike Propagation / Lif-Router)
+            // 🔧 最终形态：融合工程鲁棒性与真实拓扑涌现
             if (allTags.length > 0 && this.tagCooccurrenceMatrix) {
-                // 🌟 增强逻辑拉回：从前 5 个高权重标签中拉回关联词，且增加拉回深度
-                const topTags = allTags.slice(0, 5);
-                topTags.forEach(parentTag => {
-                    const related = this.tagCooccurrenceMatrix.get(parentTag.id);
-                    if (related) {
-                        // 找回前 4 个最相关的关联词（提升高频实体的召回机会）
-                        const sortedRelated = Array.from(related.entries())
+                // 1. 初始注入：Query 命中的种子 Tags 及其初始"膜电位" 
+                const activeNodes = new Map();
+                allTags.forEach(t => {
+                    activeNodes.set(t.id, t.adjustedWeight);
+                });
+
+                const MAX_HOPS = 2;                 // 两跳扩散，兼顾深度与性能
+                const FIRING_THRESHOLD = 0.10;      // 提高触发门槛，抑制微弱噪音
+                const DECAY_FACTOR = 0.3;           // 极强的突触衰减，防止能量无限放大
+                const MAX_EMERGENT_NODES = 50;      // 🔧 老工程师的智慧：涌现节点总数强截断
+                const MAX_NEIGHBORS_PER_NODE = 20;  // 限制单节点扇出
+
+                // 2. 迭代扩散网络
+                for (let hop = 0; hop < MAX_HOPS; hop++) {
+                    const nextWave = new Map();
+
+                    for (const [nodeId, energy] of activeNodes.entries()) {
+                        // 🌟 莱恩/小克原则：所有节点，只要达到电位阈值，都可以向下放电！这就是拓扑涟漪！
+                        if (energy < FIRING_THRESHOLD) continue;
+
+                        const synapses = this.tagCooccurrenceMatrix.get(nodeId);
+                        if (!synapses) continue;
+
+                        // 提取前 N 个最强相关突触
+                        const sortedSynapses = Array.from(synapses.entries())
                             .sort((a, b) => b[1] - a[1])
-                            .slice(0, 4);
+                            .slice(0, MAX_NEIGHBORS_PER_NODE);
+
+                        // 脉冲传递
+                        for (const [neighborId, coocWeight] of sortedSynapses) {
+                            // TagMemo V7: 利用内生残差作为节点增益
+                            const nodeResidual = this.tagIntrinsicResiduals?.get(nodeId) ?? 1.0;
+                            const injectedCurrent = energy * coocWeight * DECAY_FACTOR * nodeResidual;
                             
-                        sortedRelated.forEach(([relId, weight]) => {
-                            if (!seenTagIds.has(relId)) {
-                                // 仅记录 ID，稍后统一批量查询
-                                allTags.push({
-                                    id: relId,
-                                    adjustedWeight: parentTag.adjustedWeight * 0.5, // 关联词权重减半
-                                    isPullback: true
-                                });
-                                seenTagIds.add(relId);
-                            }
+                            // 🔧 老工程师的智慧：微电流直接丢弃，极大缩减 Map 大小与计算量
+                            if (injectedCurrent < 0.01) continue; 
+
+                            const accumulated = nextWave.get(neighborId) || 0;
+                            nextWave.set(neighborId, accumulated + injectedCurrent);
+                        }
+                    }
+
+                    // 3. 将新一波激发的电流叠加到全局激活总图中
+                    let propagated = false;
+                    for (const [nid, newEnergy] of nextWave.entries()) {
+                        const oldEnergy = activeNodes.get(nid) || 0;
+                        activeNodes.set(nid, oldEnergy + newEnergy);
+
+                        if (newEnergy > 0.01) {
+                            propagated = true;
+                        }
+                    }
+
+                    if (!propagated) break;
+                }
+
+                // 4. 将涌现出来的高电位节点，重新塞回到 allTags
+                const allTagsMap = new Map();
+                allTags.forEach(t => allTagsMap.set(t.id, t));
+
+                const newAllTags = [];
+                const emergentCandidates = [];
+                seenTagIds.clear();
+
+                for (const [nid, emergentEnergy] of activeNodes.entries()) {
+                    if (allTagsMap.has(nid)) {
+                        // 原始就有这个 Tag (种子节点)
+                        const existingTag = allTagsMap.get(nid);
+                        // 🌟 小克的精妙细节：取 max，防止种子被双向/循环共现不合理膨胀
+                        existingTag.adjustedWeight = Math.max(existingTag.adjustedWeight, emergentEnergy);
+                        newAllTags.push(existingTag);
+                        seenTagIds.add(nid);
+                    } else {
+                        // 纯粹因为拓扑传导「涌现」出来的关联节点
+                        emergentCandidates.push({
+                            id: nid,
+                            adjustedWeight: emergentEnergy,
+                            isPullback: true // 涌现节点标记
                         });
                     }
+                }
+                
+                // 🔧 老工程师的智慧：只保留能量最高的 Top-K 涌现节点，防止污染下游去重阶段的语义空间
+                emergentCandidates.sort((a, b) => b.adjustedWeight - a.adjustedWeight);
+                const topEmergent = emergentCandidates.slice(0, MAX_EMERGENT_NODES);
+                topEmergent.forEach(t => {
+                    newAllTags.push(t);
+                    seenTagIds.add(t.id);
                 });
+
+                if (debug && topEmergent.length > 0) {
+                    console.log(`[TagMemo-V6 Spike] Seeds=${allTagsMap.size}, Emergent=${topEmergent.length} (capped from ${emergentCandidates.length}), Total=${newAllTags.length}`);
+                }
+                
+                // 将 allTags 指向经历过脉冲洗礼的完整网络
+                allTags.length = 0;
+                allTags.push(...newAllTags);
             }
 
             // [4.6] 核心 Tag 补全 (确保聚光灯不遗漏)
@@ -573,12 +708,12 @@ class KnowledgeBaseManager {
                 const missingCoreTags = Array.from(coreTagSet).filter(ct =>
                     !allTags.some(at => at.name && at.name.toLowerCase() === ct)
                 );
-                
+
                 if (missingCoreTags.length > 0) {
                     try {
                         const placeholders = missingCoreTags.map(() => '?').join(',');
                         const rows = this.db.prepare(`SELECT id, name, vector FROM tags WHERE name IN (${placeholders})`).all(...missingCoreTags);
-                        
+
                         // 获取当前 pyramid 的最大权重作为基准
                         const maxBaseWeight = allTags.length > 0 ? Math.max(...allTags.map(t => t.adjustedWeight / 1.33)) : 1.0;
 
@@ -596,36 +731,71 @@ class KnowledgeBaseManager {
                             }
                         });
                     } catch (e) {
-                        console.warn('[TagMemo-V3] Failed to supplement core tags:', e.message);
+                        console.warn('[TagMemo-V6] Failed to supplement core tags:', e.message);
                     }
                 }
             }
 
+            // [4.7] 🎈 注入幽灵节点 (暗度陈仓)
+            let ghostIdCounter = -1; // 专属负数 ID
+            const ghostVectorMap = new Map();
+            // 获取当前基准权重
+            const maxBaseWeight = allTags.length > 0 ? Math.max(...allTags.map(t => t.adjustedWeight / 1.33)) : 1.0;
+
+            const injectGhosts = (ghosts, isCore) => {
+                ghosts.forEach(ghost => {
+                    const gid = ghostIdCounter--;
+                    // 1. 塞进 allTags 参与拓扑运算
+                    allTags.push({
+                        id: gid,
+                        name: ghost.name,
+                        adjustedWeight: maxBaseWeight * (isCore ? dynamicCoreBoostFactor : 1.0),
+                        isCore: isCore,
+                        isVirtual: true
+                    });
+                    // 2. 存入幽灵字典备用
+                    ghostVectorMap.set(gid, {
+                        id: gid,
+                        name: ghost.name,
+                        vector: ghost.vector // Float32Array 本体
+                    });
+                    seenTagIds.add(gid);
+                });
+            };
+
+            injectGhosts(hardGhostObjects, true);
+            injectGhosts(softGhostObjects, false);
+
             if (allTags.length === 0) return { vector: originalFloat32, info: null };
 
             // [5] 批量获取向量与名称 (性能优化：1次查询替代 N次循环查询)
-            const allTagIds = allTags.map(t => t.id);
-            const tagRows = this.db.prepare(
-                `SELECT id, name, vector FROM tags WHERE id IN (${allTagIds.map(() => '?').join(',')})`
-            ).all(...allTagIds);
+            const dbTagIds = allTags.filter(t => t.id > 0).map(t => t.id);
+            const tagRows = dbTagIds.length > 0
+                ? this.db.prepare(`SELECT id, name, vector FROM tags WHERE id IN (${dbTagIds.map(() => '?').join(',')})`).all(...dbTagIds)
+                : [];
             const tagDataMap = new Map(tagRows.map(r => [r.id, r]));
+
+            // 🌟 终极闭环：把幽灵向量混入正规军的 Map 里！
+            for (const [gid, ghostData] of ghostVectorMap.entries()) {
+                tagDataMap.set(gid, ghostData);
+            }
 
             // [5.5] 语义去重 (Semantic Deduplication)
             // 目的：消除冗余标签（如“委内瑞拉局势”与“委内瑞拉危机”），为多样性腾出空间
             const deduplicatedTags = [];
             const sortedTags = [...allTags].sort((a, b) => b.adjustedWeight - a.adjustedWeight);
-            
+
             for (const tag of sortedTags) {
                 const data = tagDataMap.get(tag.id);
                 if (!data || !data.vector) continue;
-                
+
                 const vec = new Float32Array(data.vector.buffer, data.vector.byteOffset, dim);
                 let isRedundant = false;
-                
+
                 for (const existing of deduplicatedTags) {
                     const existingData = tagDataMap.get(existing.id);
                     const existingVec = new Float32Array(existingData.vector.buffer, existingData.vector.byteOffset, dim);
-                    
+
                     // 计算余弦相似度
                     let dot = 0, normA = 0, normB = 0;
                     for (let d = 0; d < dim; d++) {
@@ -634,7 +804,7 @@ class KnowledgeBaseManager {
                         normB += existingVec[d] * existingVec[d];
                     }
                     const similarity = dot / (Math.sqrt(normA) * Math.sqrt(normB));
-                    
+
                     const dedupThreshold = config.deduplicationThreshold ?? 0.88;
                     if (similarity > dedupThreshold) {
                         isRedundant = true;
@@ -644,7 +814,7 @@ class KnowledgeBaseManager {
                         break;
                     }
                 }
-                
+
                 if (!isRedundant) {
                     if (!tag.name) tag.name = data.name; // 补全名称
                     deduplicatedTags.push(tag);
@@ -654,7 +824,7 @@ class KnowledgeBaseManager {
             // [6] 构建上下文向量
             const contextVec = new Float32Array(dim);
             let totalWeight = 0;
-            
+
             for (const t of deduplicatedTags) {
                 const data = tagDataMap.get(t.id);
                 if (data && data.vector) {
@@ -677,14 +847,15 @@ class KnowledgeBaseManager {
                 return { vector: originalFloat32, info: null };
             }
 
-            // [6] 最终融合
+            // [6] 最终融合 (clamp 防止外推：boost > 1 时原向量会被反向叠加)
+            const alpha = Math.min(1.0, effectiveTagBoost);
             const fused = new Float32Array(dim);
             let fusedMag = 0;
             for (let d = 0; d < dim; d++) {
-                fused[d] = (1 - effectiveTagBoost) * originalFloat32[d] + effectiveTagBoost * contextVec[d];
+                fused[d] = (1 - alpha) * originalFloat32[d] + alpha * contextVec[d];
                 fusedMag += fused[d] * fused[d];
             }
-            
+
             fusedMag = Math.sqrt(fusedMag);
             if (fusedMag > 1e-9) for (let d = 0; d < dim; d++) fused[d] /= fusedMag;
 
@@ -719,7 +890,7 @@ class KnowledgeBaseManager {
             };
 
         } catch (e) {
-            console.error('[KnowledgeBase] TagMemo V3 CRITICAL FAIL:', e);
+            console.error('[KnowledgeBase] TagMemo V6 CRITICAL FAIL:', e);
             return { vector: originalFloat32, info: null };
         }
     }
@@ -731,8 +902,8 @@ class KnowledgeBaseManager {
      * @returns {{vector: Float32Array, info: object|null}} - 返回增强后的向量和调试信息
      */
     applyTagBoost(vector, tagBoost, coreTags = [], coreBoostFactor = 1.33) {
-        // 🚀 升级：默认使用 V3 增强算法，提供更深层的语义关联和噪音抑制
-        return this._applyTagBoostV3(vector, tagBoost, coreTags, coreBoostFactor);
+        // 🚀 升级：默认使用 V6 增强算法 (LIF Spike Propagation)，提供真正的认知拓扑涌现
+        return this._applyTagBoostV6(vector, tagBoost, coreTags, coreBoostFactor);
     }
 
     /**
@@ -752,20 +923,31 @@ class KnowledgeBaseManager {
             dominantAxes: projection.dominantAxes
         };
     }
- 
+
+    /**
+     * 🌟 Tagmemo V4: 对结果集进行智能去重 (SVD + Residual)
+     * @param {Array} candidates - 候选结果数组
+     * @param {Float32Array|Array} queryVector - 查询向量
+     * @returns {Promise<Array>} 去重后的结果
+     */
+    async deduplicateResults(candidates, queryVector) {
+        if (!this.resultDeduplicator) return candidates;
+        return await this.resultDeduplicator.deduplicate(candidates, queryVector);
+    }
+
     // =========================================================================
     // 兼容性 API (修复版)
     // =========================================================================
- 
+
     // 🛠️ 修复 3: 同步回退 + 缓存预热
     async getDiaryNameVector(diaryName) {
         if (!diaryName) return null;
-        
+
         // 1. 查内存缓存
         if (this.diaryNameVectorCache.has(diaryName)) {
             return this.diaryNameVectorCache.get(diaryName);
         }
-        
+
         // 2. 查数据库 (同步)
         try {
             const row = this.db.prepare("SELECT vector FROM kv_store WHERE key = ?").get(`diary_name:${diaryName}`);
@@ -782,7 +964,7 @@ class KnowledgeBaseManager {
         console.warn(`[KnowledgeBase] Cache MISS for diary name vector: "${diaryName}". Fetching now...`);
         return await this._fetchAndCacheDiaryNameVector(diaryName);
     }
-    
+
     // 强制同步预热缓存
     _hydrateDiaryNameCacheSync() {
         console.log('[KnowledgeBase] Hydrating diary name vectors (Sync)...');
@@ -815,7 +997,43 @@ class KnowledgeBaseManager {
         }
         return null; // 失败时返回 null
     }
-    
+
+    // 🌟 新增：基于 SQLite kv_store 的持久化插件描述向量缓存
+    async getPluginDescriptionVector(descText, getEmbeddingFn) {
+        let hash;
+        try {
+            hash = crypto.createHash('sha256').update(descText).digest('hex');
+            const key = `plugin_desc_hash:${hash}`;
+
+            // 1. 查 SQLite
+            const stmt = this.db.prepare("SELECT vector FROM kv_store WHERE key = ?");
+            const row = stmt.get(key);
+
+            if (row && row.vector) {
+                return Array.from(new Float32Array(row.vector.buffer, row.vector.byteOffset, this.config.dimension));
+            }
+
+            // 2. 未命中，去查 Embedding API
+            if (typeof getEmbeddingFn !== 'function') {
+                return null;
+            }
+
+            console.log(`[KnowledgeBase] Cache MISS for plugin description. Fetching API...`);
+            const vec = await getEmbeddingFn(descText);
+
+            if (vec) {
+                // 3. 存入 SQLite
+                const vecBuf = Buffer.from(new Float32Array(vec).buffer);
+                this.db.prepare("INSERT OR REPLACE INTO kv_store (key, vector) VALUES (?, ?)").run(key, vecBuf);
+                return vec;
+            }
+
+        } catch (e) {
+            console.error(`[KnowledgeBase] Failed to process plugin description vector:`, e.message);
+        }
+        return null;
+    }
+
     // 兼容性 API: getVectorByText
     async getVectorByText(diaryName, text) {
         const stmt = this.db.prepare('SELECT vector FROM chunks WHERE content = ? LIMIT 1');
@@ -826,46 +1044,80 @@ class KnowledgeBaseManager {
         return null;
     }
 
+    /**
+     * 🌟 新增：按文件路径列表获取所有分块及其向量
+     * 用于 Time 模式下的二次相关性排序
+     */
+    async getChunksByFilePaths(filePaths) {
+        if (!filePaths || filePaths.length === 0) return [];
+
+        // 考虑到 SQLite 参数限制（通常为 999），如果路径过多需要分批
+        const batchSize = 500;
+        let allResults = [];
+
+        for (let i = 0; i < filePaths.length; i += batchSize) {
+            const batch = filePaths.slice(i, i + batchSize);
+            const placeholders = batch.map(() => '?').join(',');
+            const stmt = this.db.prepare(`
+                SELECT c.id, c.content as text, c.vector, f.path as sourceFile
+                FROM chunks c
+                JOIN files f ON c.file_id = f.id
+                WHERE f.path IN (${placeholders})
+            `);
+
+            const rows = stmt.all(...batch);
+            const processed = rows.map(r => ({
+                id: r.id,
+                text: r.text,
+                vector: r.vector ? new Float32Array(r.vector.buffer, r.vector.byteOffset, this.config.dimension) : null,
+                sourceFile: r.sourceFile
+            }));
+            allResults.push(...processed);
+        }
+
+        return allResults;
+    }
+
     // 兼容性 API: searchSimilarTags
     async searchSimilarTags(input, k = 10) {
         // 兼容旧接口
         let queryVec;
         if (typeof input === 'string') {
-             try {
+            try {
                 const [vec] = await getEmbeddingsBatch([input], {
                     apiKey: this.config.apiKey, apiUrl: this.config.apiUrl, model: this.config.model
                 });
                 queryVec = vec;
-            } catch(e) { return []; }
+            } catch (e) { return []; }
         } else {
             queryVec = input;
         }
-        
+
         if (!queryVec) return [];
 
         try {
-             const searchVecFloat = new Float32Array(queryVec);
-             const searchBuffer = Buffer.from(searchVecFloat.buffer, searchVecFloat.byteOffset, searchVecFloat.byteLength);
-             const results = this.tagIndex.search(searchBuffer, k);
-             
-             // 需要 hydrate tag 名称
-             const hydrate = this.db.prepare("SELECT name FROM tags WHERE id = ?");
-             return results.map(r => {
-                 const row = hydrate.get(r.id);
-                 return row ? { tag: row.name, score: r.score } : null;
-             }).filter(Boolean);
+            const searchVecFloat = new Float32Array(queryVec);
+            const searchBuffer = Buffer.from(searchVecFloat.buffer, searchVecFloat.byteOffset, searchVecFloat.byteLength);
+            const results = this.tagIndex.search(searchBuffer, k);
+
+            // 需要 hydrate tag 名称
+            const hydrate = this.db.prepare("SELECT name FROM tags WHERE id = ?");
+            return results.map(r => {
+                const row = hydrate.get(r.id);
+                return row ? { tag: row.name, score: r.score } : null;
+            }).filter(Boolean);
         } catch (e) {
             return [];
         }
     }
 
     _startWatcher() {
-        if(!this.watcher) {
+        if (!this.watcher) {
             const handleFile = (filePath) => {
                 const relPath = path.relative(this.config.rootPath, filePath);
                 // 提取第一级目录作为日记本名称
                 const parts = relPath.split(path.sep);
-                const diaryName = parts.length > 1 ? parts[0] : 'Root'; 
+                const diaryName = parts.length > 1 ? parts[0] : 'Root';
 
                 if (this.config.ignoreFolders.includes(diaryName)) return;
                 const fileName = path.basename(relPath);
@@ -891,15 +1143,16 @@ class KnowledgeBaseManager {
     }
 
     async _flushBatch() {
-         if (this.isProcessing || this.pendingFiles.size === 0) return;
-         this.isProcessing = true;
-         const batchFiles = Array.from(this.pendingFiles).slice(0, this.config.maxBatchSize);
-         batchFiles.forEach(f => this.pendingFiles.delete(f));
-         if (this.batchTimer) clearTimeout(this.batchTimer);
+        if (this.isProcessing || this.pendingFiles.size === 0) return;
+        this.isProcessing = true;
 
-         console.log(`[KnowledgeBase] 🚌 Processing ${batchFiles.length} files...`);
+        // 1. 📋 准备批次：先从队列中取出，但不立即永久删除
+        const batchFiles = Array.from(this.pendingFiles).slice(0, this.config.maxBatchSize);
+        if (this.batchTimer) clearTimeout(this.batchTimer);
 
-         try {
+        console.log(`[KnowledgeBase] 🚌 Processing ${batchFiles.length} files...`);
+
+        try {
             // 1. 解析文件并按日记本分组
             const docsByDiary = new Map(); // Map<DiaryName, Array<Doc>>
             const checkFile = this.db.prepare('SELECT checksum, mtime, size FROM files WHERE path = ?');
@@ -916,7 +1169,7 @@ class KnowledgeBaseManager {
 
                     const content = await fs.readFile(filePath, 'utf-8');
                     const checksum = crypto.createHash('md5').update(content).digest('hex');
-                    
+
                     if (row && row.checksum === checksum) {
                         this.db.prepare('UPDATE files SET mtime = ?, size = ? WHERE path = ?').run(stats.mtimeMs, stats.size, relPath);
                         return;
@@ -931,16 +1184,24 @@ class KnowledgeBaseManager {
                 } catch (e) { if (e.code !== 'ENOENT') console.warn(`Read error ${filePath}:`, e.message); }
             }));
 
-            if (docsByDiary.size === 0) { this.isProcessing = false; return; }
+            if (docsByDiary.size === 0) {
+                // 🛡️ 所有文件均无变更，安全移出队列，防止无限自检循环
+                batchFiles.forEach(f => {
+                    this.pendingFiles.delete(f);
+                    this.fileRetryCount.delete(f);
+                });
+                this.isProcessing = false;
+                return;
+            }
 
             // 2. 收集所有文本进行 Embedding
-            const allChunksWithMeta = []; 
+            const allChunksWithMeta = [];
             const uniqueTags = new Set();
 
             for (const [dName, docs] of docsByDiary) {
                 docs.forEach((doc, dIdx) => {
                     const validChunks = doc.chunks.map(c => this._prepareTextForEmbedding(c)).filter(c => c !== '[EMPTY_CONTENT]');
-                    doc.chunks = validChunks; 
+                    doc.chunks = validChunks;
                     validChunks.forEach((txt, cIdx) => {
                         allChunksWithMeta.push({ text: txt, diaryName: dName, doc: doc, chunkIdx: cIdx });
                     });
@@ -964,11 +1225,13 @@ class KnowledgeBaseManager {
             const newTags = Array.from(newTagsSet);
             // 3. Embedding API Calls
             const embeddingConfig = { apiKey: this.config.apiKey, apiUrl: this.config.apiUrl, model: this.config.model };
-            
+
             let chunkVectors = [];
             if (allChunksWithMeta.length > 0) {
                 const texts = allChunksWithMeta.map(i => i.text);
                 chunkVectors = await getEmbeddingsBatch(texts, embeddingConfig);
+                // 🛡️ getEmbeddingsBatch 现在保证 chunkVectors.length === texts.length
+                // 失败/超长的位置为 null，后续写入 DB 时会跳过这些 null 向量
             }
 
             let tagVectors = [];
@@ -976,7 +1239,9 @@ class KnowledgeBaseManager {
                 const tagLimit = 100;
                 for (let i = 0; i < newTags.length; i += tagLimit) {
                     const batch = newTags.slice(i, i + tagLimit);
-                    tagVectors.push(...await getEmbeddingsBatch(batch, embeddingConfig));
+                    const batchVectors = await getEmbeddingsBatch(batch, embeddingConfig);
+                    // 同样保证长度对齐，null 表示失败
+                    tagVectors.push(...batchVectors);
                 }
             }
 
@@ -985,15 +1250,15 @@ class KnowledgeBaseManager {
                 const updates = new Map();
                 const deletions = new Map(); // 💡 新增：记录待删除的 chunk ID
                 const tagUpdates = [];
+                let actualTagChanges = 0;
 
-                const insertTag = this.db.prepare('INSERT OR IGNORE INTO tags (name, vector) VALUES (?, ?)');
-                const updateTag = this.db.prepare('UPDATE tags SET vector = ? WHERE name = ?');
+                const insertTag = this.db.prepare('INSERT INTO tags (name, vector) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET vector = excluded.vector');
                 const getTagId = this.db.prepare('SELECT id FROM tags WHERE name = ?');
 
                 newTags.forEach((t, i) => {
+                    if (!tagVectors[i]) return; // 🛡️ 跳过向量化失败的 tag
                     const vecBuf = Buffer.from(new Float32Array(tagVectors[i]).buffer);
                     insertTag.run(t, vecBuf);
-                    updateTag.run(vecBuf, t);
                     const id = getTagId.get(t).id;
                     tagCache.set(t, { id, vector: vecBuf });
                     tagUpdates.push({ id, vec: vecBuf });
@@ -1006,15 +1271,20 @@ class KnowledgeBaseManager {
                 const delChunks = this.db.prepare('DELETE FROM chunks WHERE file_id = ?');
                 const delRels = this.db.prepare('DELETE FROM file_tags WHERE file_id = ?');
                 const addChunk = this.db.prepare('INSERT INTO chunks (file_id, chunk_index, content, vector) VALUES (?, ?, ?, ?)');
-                const addRel = this.db.prepare('INSERT OR IGNORE INTO file_tags (file_id, tag_id) VALUES (?, ?)');
+                const addRel = this.db.prepare('INSERT OR IGNORE INTO file_tags (file_id, tag_id, position) VALUES (?, ?, ?)');
 
+                // 在事务前构建索引
+                const metaMap = new Map();
                 allChunksWithMeta.forEach((meta, i) => {
                     meta.vector = chunkVectors[i];
+                    // meta.doc 和 root meta.chunkIdx 是唯一标识一个 chunk的特征属性
+                    const key = `${meta.doc.relPath}:${meta.chunkIdx}`;
+                    metaMap.set(key, meta);
                 });
 
                 for (const [dName, docs] of docsByDiary) {
                     if (!updates.has(dName)) updates.set(dName, []);
-                    
+
                     docs.forEach(doc => {
                         let fileId;
                         const fRow = getFile.get(doc.relPath);
@@ -1022,7 +1292,7 @@ class KnowledgeBaseManager {
 
                         if (fRow) {
                             fileId = fRow.id;
-                            
+
                             // 💡 核心修复：在删除数据库记录前，先收集旧 chunk ID 用于后续的索引清理
                             const oldChunkIds = getOldChunkIds.all(fileId).map(c => c.id);
                             if (oldChunkIds.length > 0) {
@@ -1039,25 +1309,28 @@ class KnowledgeBaseManager {
                         }
 
                         doc.chunks.forEach((txt, i) => {
-                            const meta = allChunksWithMeta.find(m => m.doc === doc && m.chunkIdx === i);
-                            if (meta && meta.vector) {
+                            const meta = metaMap.get(`${doc.relPath}:${i}`);
+                            if (meta && meta.vector) { // 🛡️ null 向量的 chunk 自然被跳过，不会写入错误数据
                                 const vecBuf = Buffer.from(new Float32Array(meta.vector).buffer);
                                 const r = addChunk.run(fileId, i, txt, vecBuf);
                                 updates.get(dName).push({ id: r.lastInsertRowid, vec: vecBuf });
                             }
                         });
 
-                        doc.tags.forEach(t => {
+                        doc.tags.forEach((t, index) => {
                             const tInfo = tagCache.get(t);
-                            if (tInfo) addRel.run(fileId, tInfo.id);
+                            if (tInfo) {
+                                addRel.run(fileId, tInfo.id, index + 1);
+                                actualTagChanges++;
+                            }
                         });
                     });
                 }
 
-                return { updates, tagUpdates, deletions };
+                return { updates, tagUpdates, deletions, actualTagChanges };
             });
 
-            const { updates, tagUpdates, deletions } = transaction();
+            const { updates, tagUpdates, deletions, actualTagChanges } = transaction();
 
             // 💡 核心修复：在添加新向量之前，先从 Vexus 索引中移除所有旧的向量
             if (deletions && deletions.size > 0) {
@@ -1089,7 +1362,7 @@ class KnowledgeBaseManager {
             // 🛠️ 修复：针对 Diary Index 的安全写入
             for (const [dName, chunks] of updates) {
                 const idx = await this._getOrLoadDiaryIndex(dName);
-                
+
                 chunks.forEach(u => {
                     try {
                         // 尝试直接添加
@@ -1111,47 +1384,68 @@ class KnowledgeBaseManager {
                         }
                     }
                 });
-                
+
                 this._scheduleIndexSave(dName);
             }
 
+            // 5. ✅ 成功处理后，移除文件并清空重试计数
+            batchFiles.forEach(f => {
+                this.pendingFiles.delete(f);
+                this.fileRetryCount.delete(f); // 清空重试计数
+            });
+
             console.log(`[KnowledgeBase] ✅ Batch complete. Updated ${updates.size} diary indices.`);
 
-            // 优化1：数据更新后，异步重建共现矩阵
-            setImmediate(() => this._buildCooccurrenceMatrix());
+            // 优化1：数据更新后，检查是否需要重建矩阵（防抖 + 阈值）
+            // 🌟 V7.2: 使用实际生成的 tag 共现对变动（以写入 file_tags 的行数为准）进行触发
+            this._scheduleMatrixRebuild(actualTagChanges);
 
-         } catch (e) {
-             console.error('[KnowledgeBase] ❌ Batch processing failed catastrophically.');
-             console.error('Error Details:', e);
-             if (e.stack) {
-                 console.error('Stack Trace:', e.stack);
-             }
-         }
-         finally {
-             this.isProcessing = false;
-             if (this.pendingFiles.size > 0) setImmediate(() => this._flushBatch());
-         }
+        } catch (e) {
+            console.error('[KnowledgeBase] ❌ Batch processing failed catastrophically.');
+            console.error('Error Details:', e);
+            if (e.stack) {
+                console.error('Stack Trace:', e.stack);
+            }
+
+            // 🛡️ 核心修复：重试计数，防止确定性失败导致无限循环
+            const MAX_FILE_RETRIES = 3;
+            batchFiles.forEach(f => {
+                const count = (this.fileRetryCount.get(f) || 0) + 1;
+                if (count >= MAX_FILE_RETRIES) {
+                    console.error(`[KnowledgeBase] ⛔ File "${f}" failed ${MAX_FILE_RETRIES} times. Removing from queue permanently.`);
+                    this.pendingFiles.delete(f);
+                    this.fileRetryCount.delete(f);
+                } else {
+                    this.fileRetryCount.set(f, count);
+                    console.warn(`[KnowledgeBase] ⚠️ File "${f}" retry ${count}/${MAX_FILE_RETRIES}.`);
+                }
+            });
+        }
+        finally {
+            this.isProcessing = false;
+            if (this.pendingFiles.size > 0) setImmediate(() => this._flushBatch());
+        }
     }
-    
+
     _prepareTextForEmbedding(text) {
         const decorativeEmojis = /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu;
         // 1. 移除表情符号, 2. 合并水平空格, 3. 移除换行符周围的空格, 4. 合并多个换行符, 5. 清理首尾
         let cleaned = text.replace(decorativeEmojis, ' ')
-                          .replace(/[ \t]+/g, ' ')
-                          .replace(/ *\n */g, '\n')
-                          .replace(/\n{2,}/g, '\n')
-                          .trim();
+            .replace(/[ \t]+/g, ' ')
+            .replace(/ *\n */g, '\n')
+            .replace(/\n{2,}/g, '\n')
+            .trim();
         return cleaned.length === 0 ? '[EMPTY_CONTENT]' : cleaned;
     }
 
     async _handleDelete(filePath) {
-         const relPath = path.relative(this.config.rootPath, filePath);
-         try {
+        const relPath = path.relative(this.config.rootPath, filePath);
+        try {
             const row = this.db.prepare('SELECT id, diary_name FROM files WHERE path = ?').get(relPath);
             if (!row) return;
             const chunkIds = this.db.prepare('SELECT id FROM chunks WHERE file_id = ?').all(row.id);
             this.db.prepare('DELETE FROM files WHERE id = ?').run(row.id);
-            
+
             const idx = await this._getOrLoadDiaryIndex(row.diary_name);
             if (idx && idx.remove) {
                 chunkIds.forEach(c => idx.remove(c.id));
@@ -1202,7 +1496,7 @@ class KnowledgeBaseManager {
             let cleaned = t.replace(/[。.]+$/g, '').trim();
             return this._prepareTextForEmbedding(cleaned);
         }).filter(t => t !== '[EMPTY_CONTENT]');
-        
+
         if (this.config.tagBlacklistSuper.length > 0) {
             const superRegex = new RegExp(this.config.tagBlacklistSuper.join('|'), 'g');
             tags = tags.map(t => t.replace(superRegex, '').trim());
@@ -1210,32 +1504,226 @@ class KnowledgeBaseManager {
         tags = tags.filter(t => !this.config.tagBlacklist.has(t) && t.length > 0);
         return [...new Set(tags)];
     }
-    
-    // 优化1：新增方法，用于构建和缓存Tag共现矩阵
-    _buildCooccurrenceMatrix() {
-        console.log('[KnowledgeBase] 🧠 Building tag co-occurrence matrix...');
+
+    // 🌟 TagMemo V7: 有向序位势能共现矩阵
+    _buildDirectedCooccurrenceMatrix() {
+        console.log('[KnowledgeBase] 🧠 Building DIRECTED tag co-occurrence matrix...');
         try {
+            // 势能参数
+            const PHI_MAX = 0.9;
+            const PHI_MIN = 0.5;
+
+            // Step 1: 获取每篇日记的 Tag 数量（用于计算势能）
+            const tagCountStmt = this.db.prepare(`
+                SELECT file_id, COUNT(*) as tag_count
+                FROM file_tags
+                GROUP BY file_id
+            `);
+            const tagCounts = new Map();
+            for (const row of tagCountStmt.iterate()) {
+                tagCounts.set(row.file_id, row.tag_count);
+            }
+
+            // Step 2: 有向共现查询
             const stmt = this.db.prepare(`
-                SELECT ft1.tag_id as tag1, ft2.tag_id as tag2, COUNT(ft1.file_id) as weight
+                SELECT 
+                    ft1.tag_id as source_tag,
+                    ft2.tag_id as target_tag,
+                    ft1.position as pos1,
+                    ft2.position as pos2,
+                    ft1.file_id as file_id
                 FROM file_tags ft1
-                JOIN file_tags ft2 ON ft1.file_id = ft2.file_id AND ft1.tag_id < ft2.tag_id
+                JOIN file_tags ft2 
+                    ON ft1.file_id = ft2.file_id 
+                    AND ft1.position < ft2.position
+                    AND ft1.position > 0 
+                    AND ft2.position > 0
+            `);
+
+            const matrix = new Map();
+
+            for (const row of stmt.iterate()) {
+                const n = tagCounts.get(row.file_id) || 1;
+                
+                // 计算序位势能
+                const phi1 = n > 1 
+                    ? PHI_MAX - (PHI_MAX - PHI_MIN) * (row.pos1 - 1) / (n - 1)
+                    : PHI_MAX;
+                const phi2 = n > 1 
+                    ? PHI_MAX - (PHI_MAX - PHI_MIN) * (row.pos2 - 1) / (n - 1)
+                    : PHI_MAX;
+
+                const weight = phi1 * phi2;
+
+                // 有向边：source → target
+                if (!matrix.has(row.source_tag)) matrix.set(row.source_tag, new Map());
+                const existing = matrix.get(row.source_tag).get(row.target_tag) || 0;
+                matrix.get(row.source_tag).set(row.target_tag, existing + weight);
+            }
+
+            // Step 3: 处理旧数据（position = 0 的回退为无向等权重）
+            const legacyStmt = this.db.prepare(`
+                SELECT ft1.tag_id as tag1, ft2.tag_id as tag2, COUNT(ft1.file_id) as cnt
+                FROM file_tags ft1
+                JOIN file_tags ft2 
+                    ON ft1.file_id = ft2.file_id 
+                    AND ft1.tag_id < ft2.tag_id
+                WHERE ft1.position = 0 OR ft2.position = 0
                 GROUP BY ft1.tag_id, ft2.tag_id
             `);
-            
-            const matrix = new Map();
-            for (const row of stmt.iterate()) {
+
+            const LEGACY_PHI = 0.7; // 旧数据统一势能
+            for (const row of legacyStmt.iterate()) {
+                const weight = row.cnt * LEGACY_PHI * LEGACY_PHI;
+                
                 if (!matrix.has(row.tag1)) matrix.set(row.tag1, new Map());
                 if (!matrix.has(row.tag2)) matrix.set(row.tag2, new Map());
                 
-                matrix.get(row.tag1).set(row.tag2, row.weight);
-                matrix.get(row.tag2).set(row.tag1, row.weight); // 对称填充
+                const e1 = matrix.get(row.tag1).get(row.tag2) || 0;
+                matrix.get(row.tag1).set(row.tag2, e1 + weight);
+                const e2 = matrix.get(row.tag2).get(row.tag1) || 0;
+                matrix.get(row.tag2).set(row.tag1, e2 + weight);
             }
+
             this.tagCooccurrenceMatrix = matrix;
-            console.log(`[KnowledgeBase] ✅ Tag co-occurrence matrix built. (${matrix.size} tags)`);
+            console.log(`[KnowledgeBase] ✅ Directed co-occurrence matrix built. (${matrix.size} source nodes)`);
         } catch (e) {
-            console.error('[KnowledgeBase] ❌ Failed to build tag co-occurrence matrix:', e);
-            // 初始化为空Map，防止后续代码出错
+            console.error('[KnowledgeBase] ❌ Failed to build directed matrix:', e);
             this.tagCooccurrenceMatrix = new Map();
+        }
+    }
+
+
+    // 🌟 TagMemo V7: 加载内生残差
+    _loadIntrinsicResiduals() {
+        try {
+            const rows = this.db.prepare(
+                'SELECT tag_id, residual_energy FROM tag_intrinsic_residuals'
+            ).all();
+            
+            this.tagIntrinsicResiduals = new Map();
+            for (const row of rows) {
+                // 归一化到 [0.5, 2.0] 范围，避免极端值
+                const clamped = Math.max(0.5, Math.min(2.0, row.residual_energy));
+                this.tagIntrinsicResiduals.set(row.tag_id, clamped);
+            }
+            console.log(`[KnowledgeBase] ✅ Loaded ${this.tagIntrinsicResiduals.size} intrinsic residuals`);
+        } catch (e) {
+            console.warn('[KnowledgeBase] ⚠️ No intrinsic residuals available:', e.message);
+            this.tagIntrinsicResiduals = null;
+        }
+    }
+
+    // 🌟 TagMemo V7.7: 混合调度器 (阈值门槛 + 滑动窗口防抖)
+    _scheduleMatrixRebuild(changeCount = 1) {
+        if (changeCount <= 0) return; 
+        
+        this._accumulatedTagChanges += changeCount;
+        
+        // 动态计算 1% 阈值
+        let threshold = 50; 
+        try {
+            const totalTags = this.db.prepare('SELECT COUNT(*) as count FROM tags').get()?.count || 0;
+            threshold = Math.max(10, Math.min(200, Math.floor(totalTags * 0.01)));
+        } catch (e) { /* ignore */ }
+
+        // 仅在达到阈值后，才进入防抖逻辑（实现“大变动后的冷静期”）
+        if (this._accumulatedTagChanges >= threshold) {
+            // 无论如何先清除旧计时器，实现“滑动窗口”防抖
+            if (this._matrixRebuildTimer) {
+                clearTimeout(this._matrixRebuildTimer);
+            }
+
+            // 设定 5 分钟（300,000ms）的冷却防抖
+            const COOLING_DELAY = 300000; 
+            this._matrixRebuildTimer = setTimeout(() => {
+                console.log(`[KnowledgeBase] 📈 Changes reached threshold (${this._accumulatedTagChanges} >= ${threshold}) and quiet period finished. Rebuilding matrix...`);
+                this._doMatrixRebuild();
+            }, COOLING_DELAY);
+            
+            if (this._matrixRebuildTimer.unref) this._matrixRebuildTimer.unref();
+
+            // 仅在第一次开启计时器时提示
+            if (!this._matrixRebuildTimer._isLogged) {
+                console.log(`[KnowledgeBase] 🛡️ Threshold reached. Matrix rebuild scheduled after 5min of quiescence.`);
+                this._matrixRebuildTimer._isLogged = true;
+            }
+        }
+        // 低于阈值时不执行任何操作，不计入倒计时。
+    }
+
+    async _doMatrixRebuild() {
+        this._accumulatedTagChanges = 0;
+        this._matrixRebuildTimer = null;
+        this._buildDirectedCooccurrenceMatrix();
+        await this.recomputeIntrinsicResiduals();
+    }
+
+    // 🌟 TagMemo V7: 触发 Rust 预计算内生残差
+    async recomputeIntrinsicResiduals() {
+        if (!this.tagIndex || !this.tagIndex.computeIntrinsicResiduals) {
+            console.warn('[KnowledgeBase] computeIntrinsicResiduals is not available in VexusIndex');
+            return;
+        }
+        
+        console.log('[KnowledgeBase] ⚡ Triggering Rust intrinsic residual precomputation...');
+        try {
+            const dbPath = path.join(this.config.storePath, 'knowledge_base.sqlite');
+            const result = await this.tagIndex.computeIntrinsicResiduals(dbPath);
+            console.log(`[KnowledgeBase] ✅ Rust precomputation complete: ${result.computedCount} computed, ${result.skippedCount} skipped in ${result.elapsedMs.toFixed(2)}ms`);
+            
+            // 重新加载结果
+            this._loadIntrinsicResiduals();
+        } catch (e) {
+            console.error('[KnowledgeBase] ❌ Rust precomputation failed:', e.message || e);
+            if (e.stack) console.error(e.stack);
+        }
+    }
+
+    // 🌟 启动空闲索引定期扫描
+    _startIdleSweep() {
+        if (this.idleSweepTimer) return;
+        this.idleSweepTimer = setInterval(() => {
+            this._evictIdleIndices();
+        }, this.config.indexIdleSweepInterval);
+        // 允许 Node 进程在没有其他活跃事件时自然退出
+        if (this.idleSweepTimer.unref) this.idleSweepTimer.unref();
+        console.log(`[KnowledgeBase] 🧹 Idle index sweep started (TTL: ${Math.round(this.config.indexIdleTTL / 60000)}min, interval: ${Math.round(this.config.indexIdleSweepInterval / 60000)}min)`);
+    }
+
+    // 🌟 扫描并卸载空闲超时的索引
+    _evictIdleIndices() {
+        const now = Date.now();
+        const ttl = this.config.indexIdleTTL;
+        let evictedCount = 0;
+
+        for (const [diaryName, lastUsed] of this.diaryIndexLastUsed) {
+            if (now - lastUsed < ttl) continue;
+            if (!this.diaryIndices.has(diaryName)) {
+                // 时间戳残留（索引已不在内存中），清理即可
+                this.diaryIndexLastUsed.delete(diaryName);
+                continue;
+            }
+
+            // 先保存到磁盘，再从内存中移除
+            try {
+                // 如果有待保存的计时器，先取消它并立即保存
+                if (this.saveTimers.has(diaryName)) {
+                    clearTimeout(this.saveTimers.get(diaryName));
+                    this.saveTimers.delete(diaryName);
+                }
+                this._saveIndexToDisk(diaryName);
+                this.diaryIndices.delete(diaryName);
+                this.diaryIndexLastUsed.delete(diaryName);
+                evictedCount++;
+                console.log(`[KnowledgeBase] 🧹 Evicted idle index: "${diaryName}" (idle ${Math.round((now - lastUsed) / 60000)}min)`);
+            } catch (e) {
+                console.error(`[KnowledgeBase] ❌ Failed to evict index "${diaryName}":`, e.message);
+            }
+        }
+
+        if (evictedCount > 0) {
+            console.log(`[KnowledgeBase] 🧹 Idle sweep complete: evicted ${evictedCount} index(es), ${this.diaryIndices.size} remaining in memory.`);
         }
     }
 
@@ -1245,6 +1733,11 @@ class KnowledgeBaseManager {
         if (this.ragParamsWatcher) {
             this.ragParamsWatcher.close();
             this.ragParamsWatcher = null;
+        }
+        // 🌟 停止空闲扫描
+        if (this.idleSweepTimer) {
+            clearInterval(this.idleSweepTimer);
+            this.idleSweepTimer = null;
         }
 
         // 确保所有待保存的索引都被写入磁盘

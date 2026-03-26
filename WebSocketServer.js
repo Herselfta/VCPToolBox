@@ -161,6 +161,16 @@ function initialize(httpServer, config) {
             ws.send(JSON.stringify({ type: 'connection_ack', message: 'WebSocket connection successful for VCPLog.' }));
         } else if (ws.clientType === 'VCPInfo') { // 新增 VCPInfo 确认消息
             ws.send(JSON.stringify({ type: 'connection_ack', message: 'WebSocket connection successful for VCPInfo.' }));
+        } else if (ws.clientType === 'DistributedServer') {
+            // 分布式服务器连接确认，告知分配的 serverId
+            ws.send(JSON.stringify({
+                type: 'connection_ack',
+                message: 'WebSocket connection successful for DistributedServer.',
+                data: {
+                    serverId: ws.serverId,
+                    clientId: ws.clientId
+                }
+            }));
         }
         // 可以根据 ws.clientType 或其他标识符发送不同的欢迎消息
 
@@ -276,6 +286,16 @@ function initialize(httpServer, config) {
                             ws.send(JSON.stringify({ type: 'command_result', data: { requestId: parsedMessage.data.requestId, status: 'error', error: 'No active Chrome browser extension found.' }}));
                         }
                     }
+                } else if (parsedMessage.type === 'tool_approval_response') {
+                    const { requestId, approved } = parsedMessage.data;
+                    if (pluginManager) {
+                        const success = pluginManager.handleApprovalResponse(requestId, approved);
+                        if (serverConfig.debugMode) {
+                            console.log(`[WebSocketServer] Approval response for ${requestId}: ${approved ? 'APPROVED' : 'REJECTED'}. Handled: ${success}`);
+                        }
+                    }
+                } else if (ws.clientType === 'AdminPanel') {
+                    // 保持原有的 AdminPanel 逻辑，如果将来有其他 AdminPanel 专用消息
                 } else {
                     // 未来处理其他客户端类型的消息
                 }
@@ -528,6 +548,7 @@ function broadcastToAdminPanel(data) {
             clientWs.send(messageString);
         }
     });
+    console.log(`[WebSocketServer] Broadcasted to ${adminPanelClients.size} Admin Panel clients.`);
     if (serverConfig.debugMode) {
         writeLog(`Broadcasted to Admin Panel: ${messageString.substring(0, 200)}...`);
     }
