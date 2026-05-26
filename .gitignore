@@ -181,8 +181,11 @@ Plugin/RAGDiaryPlugin/semantic_groups.json
 Plugin/RAGDiaryPlugin/semantic_groups.edit.json
 Plugin/RAGDiaryPlugin/semantic_vectors/
 Plugin/TavilySearch/.vcptoolbox_tavily_cache.json
+Plugin/SkillBridge/skill-index.txt
 Plugin/UserAuth/code.bin
+Plugin/VCPTaskAssistant/task-center-data.json
 Plugin/VCPLog/log/VCPlog.txt
+sarprompt.json
 Plugin/WeatherReporter/weather_cache.json
 Plugin/WeatherReporter/weather_cache.txt
 Plugin/WeatherReporter/city_cache.txt
