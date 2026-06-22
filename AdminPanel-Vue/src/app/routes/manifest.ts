@@ -13,6 +13,7 @@ export type AppRouteId =
   | "base-config"
   | "dynamic-tools-manager"
   | "daily-notes-manager"
+  | "knowledge-base-manager"
   | "vcp-forum"
   | "image-cache-editor"
   | "emoji-gallery"
@@ -20,6 +21,8 @@ export type AppRouteId =
   | "vcptavern-editor"
   | "agent-files-editor"
   | "agent-assistant-config"
+  | "claw-mail-manager"
+  | "agent-emotion-manager"
   | "forum-assistant-config"
   | "agent-scores"
   | "toolbox-manager"
@@ -33,7 +36,9 @@ export type AppRouteId =
   | "schedule-manager"
   | "dream-manager"
   | "server-log-viewer"
+  | "semantic-model-router-editor"
   | "final-context-viewer"
+  | "bridge-hijack-config"
   | "placeholder-viewer"
   | "plugins"
   | "plugin-store"
@@ -108,11 +113,31 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     showInSidebar: true,
   },
   {
+    id: "semantic-model-router-editor",
+    routeName: "SemanticModelRouterEditor",
+    path: "/semantic-model-router-editor",
+    title: "语义模型路由器",
+    icon: "route",
+    requiresAuth: true,
+    navGroup: "core",
+    showInSidebar: true,
+  },
+  {
     id: "final-context-viewer",
     routeName: "FinalContextViewer",
     path: "/final-context-viewer",
     title: "最终上下文处理",
     icon: "schema",
+    requiresAuth: true,
+    navGroup: "core",
+    showInSidebar: true,
+  },
+  {
+    id: "bridge-hijack-config",
+    routeName: "BridgeHijackConfig",
+    path: "/bridge-hijack-config",
+    title: "前端劫持配置",
+    icon: "settings_input_component",
     requiresAuth: true,
     navGroup: "core",
     showInSidebar: true,
@@ -134,6 +159,26 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     path: "/agent-assistant-config",
     title: "Agent 通讯配置",
     icon: "diversity_3",
+    requiresAuth: true,
+    navGroup: "agentContent",
+    showInSidebar: true,
+  },
+  {
+    id: "claw-mail-manager",
+    routeName: "ClawMailManager",
+    path: "/claw-mail-manager",
+    title: "Agent 信箱",
+    icon: "mark_email_unread",
+    requiresAuth: true,
+    navGroup: "agentContent",
+    showInSidebar: true,
+  },
+  {
+    id: "agent-emotion-manager",
+    routeName: "AgentEmotionManager",
+    path: "/agent-emotion-manager",
+    title: "Agent 情绪管理",
+    icon: "neurology",
     requiresAuth: true,
     navGroup: "agentContent",
     showInSidebar: true,
@@ -223,8 +268,18 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     id: "daily-notes-manager",
     routeName: "DailyNotesManager",
     path: "/daily-notes-manager",
-    title: "日记知识库管理",
+    title: "日记管理",
     icon: "description",
+    requiresAuth: true,
+    navGroup: "knowledge",
+    showInSidebar: true,
+  },
+  {
+    id: "knowledge-base-manager",
+    routeName: "KnowledgeBaseManager",
+    path: "/knowledge-base-manager",
+    title: "知识库管理",
+    icon: "library_books",
     requiresAuth: true,
     navGroup: "knowledge",
     showInSidebar: true,

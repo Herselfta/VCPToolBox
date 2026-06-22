@@ -1,6 +1,7 @@
 let lastPageContent = '';
 let vcpIdCounter = 0;
 let isActiveTab = false; // 标记当前标签页是否为活动标签页
+let isMonitoringEnabled = false; // 从 background/storage 同步的页面监控开关
 
 function isInteractive(node) {
     if (node.nodeType !== Node.ELEMENT_NODE) {
@@ -631,6 +632,125 @@ function searchInSource(source, regex, contextChars, maxResultsPerSource) {
     return results;
 }
 
+function performScroll(params = {}) {
+    const direction = String(params.direction || 'down').toLowerCase();
+    const behavior = ['auto', 'smooth', 'instant'].includes(String(params.behavior || '').toLowerCase())
+        ? String(params.behavior).toLowerCase()
+        : 'smooth';
+    const amountParam = params.amount;
+    const xParam = params.x;
+    const yParam = params.y;
+    const target = params.target;
+
+    let scrollTarget = window;
+    let targetLabel = 'window';
+
+    if (target) {
+        const element = findElementWithLogging(target);
+        if (!element) throw new Error(`未找到滚动目标元素: ${target}`);
+        scrollTarget = element;
+        targetLabel = getElementDescriptor(element);
+    }
+
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 800;
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1200;
+    const defaultAmount = Math.floor(viewportHeight * 0.8);
+    const amount = parseNumberParam(amountParam, defaultAmount, 1, 100000);
+    let left = Number.isFinite(Number(xParam)) ? Number(xParam) : 0;
+    let top = Number.isFinite(Number(yParam)) ? Number(yParam) : 0;
+
+    if (direction === 'down') {
+        top = amount;
+    } else if (direction === 'up') {
+        top = -amount;
+    } else if (direction === 'right') {
+        left = amount;
+    } else if (direction === 'left') {
+        left = -amount;
+    } else if (direction === 'bottom') {
+        if (scrollTarget === window) {
+            top = Math.max(
+                document.documentElement.scrollHeight,
+                document.body?.scrollHeight || 0
+            );
+        } else {
+            top = scrollTarget.scrollHeight;
+        }
+    } else if (direction === 'top') {
+        if (scrollTarget === window) {
+            window.scrollTo({ top: 0, left: window.scrollX, behavior });
+        } else {
+            scrollTarget.scrollTo({ top: 0, left: scrollTarget.scrollLeft, behavior });
+        }
+        return {
+            status: 'success',
+            message: `已滚动到顶部 (${targetLabel})`,
+            result: getScrollState(scrollTarget, targetLabel)
+        };
+    } else if (direction === 'to') {
+        top = Number.isFinite(Number(yParam)) ? Number(yParam) : 0;
+        left = Number.isFinite(Number(xParam)) ? Number(xParam) : 0;
+        if (scrollTarget === window) {
+            window.scrollTo({ top, left, behavior });
+        } else {
+            scrollTarget.scrollTo({ top, left, behavior });
+        }
+        return {
+            status: 'success',
+            message: `已滚动到指定坐标 (${targetLabel})`,
+            result: getScrollState(scrollTarget, targetLabel)
+        };
+    } else if (direction === 'page_down') {
+        top = viewportHeight;
+    } else if (direction === 'page_up') {
+        top = -viewportHeight;
+    } else if (direction === 'page_right') {
+        left = viewportWidth;
+    } else if (direction === 'page_left') {
+        left = -viewportWidth;
+    } else {
+        throw new Error(`不支持的滚动方向: ${direction}`);
+    }
+
+    if (scrollTarget === window) {
+        window.scrollBy({ top, left, behavior });
+    } else {
+        scrollTarget.scrollBy({ top, left, behavior });
+    }
+
+    return {
+        status: 'success',
+        message: `滚动成功: direction=${direction}, amount=${amount}, target=${targetLabel}`,
+        result: getScrollState(scrollTarget, targetLabel)
+    };
+}
+
+function getScrollState(scrollTarget, targetLabel) {
+    if (scrollTarget === window) {
+        const doc = document.documentElement;
+        const body = document.body;
+        return {
+            target: targetLabel,
+            scrollX: window.scrollX,
+            scrollY: window.scrollY,
+            innerWidth: window.innerWidth,
+            innerHeight: window.innerHeight,
+            scrollWidth: Math.max(doc?.scrollWidth || 0, body?.scrollWidth || 0),
+            scrollHeight: Math.max(doc?.scrollHeight || 0, body?.scrollHeight || 0)
+        };
+    }
+
+    return {
+        target: targetLabel,
+        scrollLeft: scrollTarget.scrollLeft,
+        scrollTop: scrollTarget.scrollTop,
+        clientWidth: scrollTarget.clientWidth,
+        clientHeight: scrollTarget.clientHeight,
+        scrollWidth: scrollTarget.scrollWidth,
+        scrollHeight: scrollTarget.scrollHeight
+    };
+}
+
 function pageCodeSearch(params = {}) {
     const requestedMode = String(params.searchMode || 'auto').toLowerCase();
     const effectiveMode = requestedMode === 'enhanced' ? 'light' : (requestedMode === 'light' ? 'light' : 'auto');
@@ -679,20 +799,29 @@ function pageCodeSearch(params = {}) {
     };
 }
 
-function sendPageInfoUpdate() {
+function sendPageInfoUpdate(options = {}) {
+    const isForcedUpdate = options.force === true;
+
+    // 监控关闭时静默跳过自动更新，避免控制台持续刷新 VCP Content 日志。
+    if (!isMonitoringEnabled && !isForcedUpdate) {
+        return;
+    }
+
     // 关键检查：只有活动标签页才发送更新（或页面刚加载完成时）
     if (!isActiveTab && document.hidden) {
-        console.log('[VCP Content] ⚠️ 当前非活动标签页，跳过更新');
+        if (isMonitoringEnabled) {
+            console.log('[VCP Content] ⚠️ 当前非活动标签页，跳过更新');
+        }
         return;
     }
     
     const currentPageContent = pageToMarkdown();
     if (currentPageContent && currentPageContent !== lastPageContent) {
         lastPageContent = currentPageContent;
-        console.log('[VCP Content] 📤 发送页面信息到background (活动标签页)');
+        console.log(`[VCP Content] 📤 发送${isForcedUpdate ? '强制' : '自动'}页面信息到background (活动标签页)`);
         chrome.runtime.sendMessage({
             type: 'PAGE_INFO_UPDATE',
-            data: { markdown: currentPageContent }
+            data: { markdown: currentPageContent, force: isForcedUpdate }
         }, () => {
             if (chrome.runtime.lastError) {
                 // console.log("[VCP Content] Page info update failed, context likely invalidated.");
@@ -709,9 +838,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         isActiveTab = false; // 重置活动状态
     } else if (request.type === 'REQUEST_PAGE_INFO_UPDATE') {
         // 收到请求说明这是活动标签页
+        isMonitoringEnabled = true;
         console.log('[VCP Content] 📍 收到更新请求，标记为活动标签页');
         isActiveTab = true;
         sendPageInfoUpdate();
+    } else if (request.type === 'MONITORING_STATUS_CHANGED') {
+        isMonitoringEnabled = request.isMonitoringEnabled === true;
+        if (!isMonitoringEnabled) {
+            isActiveTab = false;
+        }
     } else if (request.type === 'FORCE_PAGE_UPDATE') {
         // 新增：强制更新页面信息（手动刷新）
         console.log('[VCP Content] 🔄 收到强制更新请求');
@@ -722,7 +857,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             console.log('[VCP Content] 📤 发送强制更新的页面信息');
             chrome.runtime.sendMessage({
                 type: 'PAGE_INFO_UPDATE',
-                data: { markdown: currentPageContent }
+                data: { markdown: currentPageContent, force: true }
             }, () => {
                 if (chrome.runtime.lastError) {
                     console.log("[VCP Content] ❌ 强制更新失败:", chrome.runtime.lastError.message);
@@ -738,7 +873,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
         return true; // 保持消息通道开放
     } else if (request.type === 'EXECUTE_COMMAND') {
-        const { command, target, text, requestId, sourceClientId, query, scope, useRegex, caseSensitive, contextChars, maxResults, searchMode } = request.data;
+        const { command, target, text, requestId, sourceClientId, query, scope, useRegex, caseSensitive, contextChars, maxResults, searchMode, direction, amount, x, y, behavior } = request.data;
         
         const handleCommand = async () => {
             let result = {};
@@ -762,6 +897,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         contextChars,
                         maxResults,
                         searchMode
+                    });
+                } else if (command === 'scroll') {
+                    result = performScroll({
+                        target,
+                        direction,
+                        amount,
+                        x,
+                        y,
+                        behavior
                     });
                 } else if (command === 'execute_script') {
                     throw new Error('execute_script 已迁移到 background 的 chrome.scripting MAIN world 执行路径');
@@ -797,7 +941,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     console.log("Could not send command result:", chrome.runtime.lastError.message);
                 }
             });
-            setTimeout(sendPageInfoUpdate, 500);
+            setTimeout(() => sendPageInfoUpdate({ force: true }), 500);
         };
 
         handleCommand();
@@ -824,12 +968,19 @@ document.addEventListener('scroll', debouncedSendPageInfoUpdate, true); // 监�
 window.addEventListener('load', () => {
     // 页面加载时检查是否为活动标签页
     isActiveTab = !document.hidden;
-    console.log('[VCP Content] 📄 页面加载完成，活动状态:', isActiveTab);
-    // 页面加载完成后总是尝试发送一次更新
+    if (isMonitoringEnabled) {
+        console.log('[VCP Content] 📄 页面加载完成，活动状态:', isActiveTab);
+    }
+    // 页面加载完成后尝试发送一次更新；监控关闭时会静默跳过
     sendPageInfoUpdate();
 });
 
 document.addEventListener('visibilitychange', () => {
+    if (!isMonitoringEnabled) {
+        isActiveTab = false;
+        return;
+    }
+
     if (document.visibilityState === 'visible') {
         console.log('[VCP Content] 👁️ 标签页变为可见，标记为活动');
         isActiveTab = true;
@@ -856,6 +1007,10 @@ document.addEventListener('visibilitychange', () => {
 
 // 新增：窗口获得焦点时也检查并更新
 window.addEventListener('focus', () => {
+    if (!isMonitoringEnabled) {
+        return;
+    }
+
     console.log('[VCP Content] 🎯 窗口获得焦点，验证活动状态');
     chrome.runtime.sendMessage({ type: 'VERIFY_ACTIVE_TAB' }, (response) => {
         if (chrome.runtime.lastError) return;
@@ -868,12 +1023,16 @@ window.addEventListener('focus', () => {
     });
 });
 
-// 定期更新，但只在活动标签页时发送
+// 定期更新，但只在监控开启且活动标签页时发送
 setInterval(() => {
-    if (isActiveTab && !document.hidden) {
+    if (isMonitoringEnabled && isActiveTab && !document.hidden) {
         sendPageInfoUpdate();
     }
 }, 5000);
+
+chrome.storage.local.get(['isMonitoringEnabled'], (result) => {
+    isMonitoringEnabled = result.isMonitoringEnabled === true;
+});
 
 function debounce(func, wait) {
     let timeout;

@@ -36,9 +36,15 @@ export type * from './news'
 export { pluginApi } from './plugin'
 export type * from './plugin'
 
+export { clawMailApi } from './clawMail'
+export type * from './clawMail'
+
 // Agent 管理 API
 export { agentApi } from './agent'
 export type * from './agent'
+
+export { openHerPersonaApi } from './openHerPersona'
+export type * from './openHerPersona'
 
 export { adminConfigApi } from './admin-config'
 export type * from './admin-config'
@@ -78,6 +84,9 @@ export type * from './toolList'
 
 export { dynamicToolsApi } from './dynamicTools'
 export type * from './dynamicTools'
+
+export { semanticRouterApi } from './semanticRouter'
+export type * from './semanticRouter'
 
 export { vcptavernApi } from './vcptavern'
 export type * from './vcptavern'

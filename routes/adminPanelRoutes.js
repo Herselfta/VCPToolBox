@@ -10,12 +10,17 @@ module.exports = function (
   DEBUG_MODE,
   dailyNoteRootPath,
   pluginManager,
+  knowledgeRootPath,
   getCurrentServerLogPath,
   vectorDBManager,
   agentDirPath,
   cachedEmojiLists,
   tvsDirPath,
-  triggerRestart
+  triggerRestart,
+  semanticModelRouter,
+  modelRedirectHandler,
+  apiUrl,
+  apiKey
 ) {
   if (!agentDirPath || typeof agentDirPath !== "string") {
     throw new Error(
@@ -38,12 +43,17 @@ module.exports = function (
     DEBUG_MODE,
     dailyNoteRootPath,
     pluginManager,
+    knowledgeRootPath,
     getCurrentServerLogPath,
     vectorDBManager,
     agentDirPath,
     cachedEmojiLists,
     tvsDirPath,
     triggerRestart,
+    semanticModelRouter,
+    modelRedirectHandler,
+    apiUrl,
+    apiKey,
   };
 
   /**
@@ -84,15 +94,20 @@ module.exports = function (
   mount("/", "schedules"); // Handles /schedules/*
   mount("/", "rag"); // Handles /rag-tags, /rag-params, /available-clusters, etc.
   mount("/", "agentAssistant"); // Handles /agent-assistant/*
+  mount("/", "openHerPersona"); // Handles /openher-persona/*
   mount("/", "taskAssistant"); // Handles /task-assistant/*
   mount("/", "toolListEditor"); // Handles /tool-list/*
-    mount("/", "dynamicTools"); // Handles /dynamic-tools/*
+  mount("/", "dynamicTools"); // Handles /dynamic-tools/*
+  mount("/", "semanticRouter"); // Handles /semantic-router/*
   mount("/", "dream"); // Handles /dream-logs/*, /dream-operation/*
   mount("/", "dailyNotes"); // Wrapper for existing dailyNotesRoutes (Handles /dailynotes/*)
   mount("/", "newapiMonitor"); // Handles /newapi-monitor/*
   mount("/", "sarPrompts"); // Handles /sarprompts/*
   mount("/", "emojis"); // Handles /emojis/*
   mount("/", "pluginStore"); // Handles /plugin-store/*
+  mount("/", "bridgeProfiles"); // Handles /bridge-profiles/*
+  mount("/", "multimodalConfig"); // Handles /multimodal-config (JSON 真相源 + 热更新)
+  mount("/", "clawMail"); // Handles /claw-mail/*
 
   return adminApiRouter;
 };
