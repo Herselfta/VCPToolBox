@@ -11,6 +11,7 @@ export type AppRouteId =
   | "login"
   | "dashboard"
   | "base-config"
+  | "theme-editor"
   | "dynamic-tools-manager"
   | "daily-notes-manager"
   | "knowledge-base-manager"
@@ -31,6 +32,7 @@ export type AppRouteId =
   | "tool-list-editor"
   | "preprocessor-order-manager"
   | "tool-approval-manager"
+  | "tool-call-records-manager"
   | "thinking-chains-editor"
   | "rag-tuning"
   | "schedule-manager"
@@ -98,6 +100,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     path: "/base-config",
     title: "全局基础配置",
     icon: "settings",
+    requiresAuth: true,
+    navGroup: "core",
+    showInSidebar: true,
+  },
+  {
+    id: "theme-editor",
+    routeName: "ThemeEditor",
+    path: "/theme-editor",
+    title: "主题编辑器",
+    icon: "palette",
     requiresAuth: true,
     navGroup: "core",
     showInSidebar: true,
@@ -381,6 +393,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     path: "/tool-approval-manager",
     title: "插件调用审核管理",
     icon: "verified_user",
+    requiresAuth: true,
+    navGroup: "toolsPlugins",
+    showInSidebar: true,
+  },
+  {
+    id: "tool-call-records-manager",
+    routeName: "ToolCallRecordsManager",
+    path: "/tool-call-records-manager",
+    title: "插件调用记录管理",
+    icon: "receipt_long",
     requiresAuth: true,
     navGroup: "toolsPlugins",
     showInSidebar: true,

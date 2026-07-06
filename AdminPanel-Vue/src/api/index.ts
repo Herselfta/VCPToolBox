@@ -82,6 +82,9 @@ export type * from './tvs'
 export { toolListApi } from './toolList'
 export type * from './toolList'
 
+export { toolCallRecordsApi } from './toolCallRecords'
+export type * from './toolCallRecords'
+
 export { dynamicToolsApi } from './dynamicTools'
 export type * from './dynamicTools'
 
@@ -96,6 +99,9 @@ export type * from './forum'
 
 export { forumAssistantApi } from './forum-assistant'
 export type * from './forum-assistant'
+
+export { tarotDivinationApi } from './tarotDivination'
+export type * from './tarotDivination'
 
 // 插件商店 API
 export { pluginStoreApi } from './pluginStore'
