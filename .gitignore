@@ -248,3 +248,4 @@ Plugin/.backup/
 # ==== 开发SDK ====
 Plugin/VCPQQBotServer/bot-node-sdk-main
 Plugin/VCPBridgeServer/bridge-config.json
+Plugin/WeatherReporter/weather_cache.json

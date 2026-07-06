@@ -1,38 +1,6 @@
 {
   "hourly": [
     {
-      "fxTime": "2026-07-06T20:00+08:00",
-      "temp": "29",
-      "icon": "151",
-      "text": "多云",
-      "wind360": "270",
-      "windDir": "西风",
-      "windScale": "1-3",
-      "windSpeed": "14",
-      "humidity": "60",
-      "pop": "7",
-      "precip": "0.0",
-      "pressure": "990",
-      "cloud": "51",
-      "dew": "19"
-    },
-    {
-      "fxTime": "2026-07-06T21:00+08:00",
-      "temp": "28",
-      "icon": "151",
-      "text": "多云",
-      "wind360": "142",
-      "windDir": "东南风",
-      "windScale": "4-5",
-      "windSpeed": "32",
-      "humidity": "66",
-      "pop": "7",
-      "precip": "0.0",
-      "pressure": "990",
-      "cloud": "43",
-      "dew": "19"
-    },
-    {
       "fxTime": "2026-07-06T22:00+08:00",
       "temp": "27",
       "icon": "151",
@@ -76,7 +44,7 @@
       "humidity": "83",
       "pop": "6",
       "precip": "0.0",
-      "pressure": "993",
+      "pressure": "992",
       "cloud": "38",
       "dew": "19"
     },
@@ -92,7 +60,7 @@
       "humidity": "81",
       "pop": "3",
       "precip": "0.0",
-      "pressure": "992",
+      "pressure": "993",
       "cloud": "50",
       "dew": "19"
     },
@@ -108,7 +76,7 @@
       "humidity": "82",
       "pop": "3",
       "precip": "0.0",
-      "pressure": "992",
+      "pressure": "993",
       "cloud": "61",
       "dew": "20"
     },
@@ -156,7 +124,7 @@
       "humidity": "86",
       "pop": "5",
       "precip": "0.0",
-      "pressure": "991",
+      "pressure": "992",
       "cloud": "12",
       "dew": "20"
     },
@@ -172,7 +140,7 @@
       "humidity": "85",
       "pop": "6",
       "precip": "0.0",
-      "pressure": "991",
+      "pressure": "992",
       "cloud": "8",
       "dew": "20"
     },
@@ -252,7 +220,7 @@
       "humidity": "63",
       "pop": "5",
       "precip": "0.0",
-      "pressure": "992",
+      "pressure": "993",
       "cloud": "85",
       "dew": "21"
     },
@@ -267,7 +235,7 @@
       "windSpeed": "7",
       "humidity": "59",
       "pop": "70",
-      "precip": "0.16",
+      "precip": "0.5",
       "pressure": "992",
       "cloud": "88",
       "dew": "21"
@@ -332,7 +300,7 @@
       "humidity": "62",
       "pop": "17",
       "precip": "0.0",
-      "pressure": "990",
+      "pressure": "989",
       "cloud": "83",
       "dew": "21"
     },
@@ -347,7 +315,7 @@
       "windSpeed": "10",
       "humidity": "68",
       "pop": "70",
-      "precip": "0.13",
+      "precip": "0.48",
       "pressure": "989",
       "cloud": "77",
       "dew": "21"
@@ -380,31 +348,44 @@
       "humidity": "72",
       "pop": "20",
       "precip": "0.0",
-      "pressure": "989",
+      "pressure": "990",
       "cloud": "91",
+      "dew": "20"
+    },
+    {
+      "fxTime": "2026-07-07T20:00+08:00",
+      "temp": "27",
+      "icon": "302",
+      "text": "雷阵雨",
+      "wind360": "63",
+      "windDir": "东北风",
+      "windScale": "1-3",
+      "windSpeed": "10",
+      "humidity": "75",
+      "pop": "70",
+      "precip": "0.16",
+      "pressure": "991",
+      "cloud": "97",
+      "dew": "20"
+    },
+    {
+      "fxTime": "2026-07-07T21:00+08:00",
+      "temp": "27",
+      "icon": "151",
+      "text": "多云",
+      "wind360": "134",
+      "windDir": "东南风",
+      "windScale": "1-3",
+      "windSpeed": "10",
+      "humidity": "79",
+      "pop": "20",
+      "precip": "0.0",
+      "pressure": "992",
+      "cloud": "96",
       "dew": "20"
     }
   ],
-  "warning": [
-    {
-      "id": "10101010020260706091703603682708",
-      "sender": "北京市气象局",
-      "pubTime": "2026-07-06T09:17+08:00",
-      "title": "北京市气象台2026年07月06日09时15分发布雷电黄色预警信号",
-      "startTime": "2026-07-06T09:15+08:00",
-      "endTime": "2026-07-07T01:00+08:00",
-      "status": "active",
-      "level": "黄色",
-      "severity": "Moderate",
-      "severityColor": "Yellow",
-      "type": "1014",
-      "typeName": "雷电",
-      "urgency": "",
-      "certainty": "",
-      "text": "市气象台2026年07月06日09时15分发布雷电黄色预警信号：预计，7月6日14时至7日00时，我市自西向东将先后出现分散性雷阵雨。延庆、昌平、门头沟、房山、怀柔、密云、平谷、顺义等区相对明显，局地短时雨强较大，并伴有7级左右阵风和冰雹，请注意防范。",
-      "related": ""
-    }
-  ],
+  "warning": [],
   "daily": [
     {
       "fxDate": "2026-07-06",
@@ -428,10 +409,10 @@
       "windDirNight": "西风",
       "windScaleNight": "1-3",
       "windSpeedNight": "3",
-      "humidity": "60",
+      "humidity": "55",
       "precip": "1.0",
-      "pressure": "991",
-      "vis": "23",
+      "pressure": "992",
+      "vis": "24",
       "cloud": "55",
       "uvIndex": "9"
     },
@@ -457,7 +438,7 @@
       "windDirNight": "东风",
       "windScaleNight": "1-3",
       "windSpeedNight": "3",
-      "humidity": "78",
+      "humidity": "72",
       "precip": "2.3",
       "pressure": "992",
       "vis": "23",
@@ -486,10 +467,10 @@
       "windDirNight": "东南风",
       "windScaleNight": "1-3",
       "windSpeedNight": "3",
-      "humidity": "85",
+      "humidity": "74",
       "precip": "2.5",
-      "pressure": "993",
-      "vis": "22",
+      "pressure": "992",
+      "vis": "23",
       "cloud": "55",
       "uvIndex": "11"
     },
@@ -515,10 +496,10 @@
       "windDirNight": "东风",
       "windScaleNight": "1-3",
       "windSpeedNight": "3",
-      "humidity": "78",
+      "humidity": "84",
       "precip": "0.0",
-      "pressure": "995",
-      "vis": "23",
+      "pressure": "994",
+      "vis": "21",
       "cloud": "13",
       "uvIndex": "10"
     },
@@ -544,10 +525,10 @@
       "windDirNight": "南风",
       "windScaleNight": "1-3",
       "windSpeedNight": "3",
-      "humidity": "95",
+      "humidity": "91",
       "precip": "0.0",
-      "pressure": "996",
-      "vis": "6",
+      "pressure": "997",
+      "vis": "22",
       "cloud": "25",
       "uvIndex": "7"
     },
@@ -573,10 +554,10 @@
       "windDirNight": "南风",
       "windScaleNight": "1-3",
       "windSpeedNight": "3",
-      "humidity": "97",
+      "humidity": "89",
       "precip": "1.5",
-      "pressure": "998",
-      "vis": "2",
+      "pressure": "1000",
+      "vis": "23",
       "cloud": "60",
       "uvIndex": "7"
     },
@@ -602,9 +583,9 @@
       "windDirNight": "东风",
       "windScaleNight": "1-3",
       "windSpeedNight": "3",
-      "humidity": "92",
+      "humidity": "82",
       "precip": "0.0",
-      "pressure": "999",
+      "pressure": "1000",
       "vis": "23",
       "cloud": "70",
       "uvIndex": "11"
@@ -612,7 +593,7 @@
   ],
   "moon": {
     "code": "200",
-    "updateTime": "2026-07-06T19:00+08:00",
+    "updateTime": "2026-07-06T21:00+08:00",
     "fxLink": "https://www.qweather.com/weather/beijing-101010100.html",
     "moonrise": "2026-07-06T23:04+08:00",
     "moonset": "2026-07-06T10:56+08:00",
@@ -796,17 +777,17 @@
     }
   },
   "airQuality": {
-    "aqi": 68,
-    "primary": "O3",
-    "category": "良",
-    "pm2p5": 19
+    "aqi": 27,
+    "primary": "NA",
+    "category": "优",
+    "pm2p5": 15
   },
   "solarAngle": {
     "code": "200",
-    "solarElevationAngle": "4.73",
-    "solarAzimuthAngle": "295.77",
-    "solarHour": "1853",
-    "hourAngle": "-103.46",
+    "solarElevationAngle": "-14.92",
+    "solarAzimuthAngle": "317.93",
+    "solarHour": "2101",
+    "hourAngle": "-135.45",
     "refer": {
       "sources": [
         "QWeather"
@@ -816,5 +797,5 @@
       ]
     }
   },
-  "lastUpdate": "2026-07-06T11:13:35.685Z"
+  "lastUpdate": "2026-07-06T13:21:05.028Z"
 }

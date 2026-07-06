@@ -29,7 +29,18 @@ const agentOptions = {
 const keepAliveHttpAgent = new http.Agent(agentOptions);
 const keepAliveHttpsAgent = new https.Agent(agentOptions);
 
+let HttpsProxyAgent = null;
+try {
+  HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent;
+} catch (e) {
+  // Silent fallback if package not installed
+}
+
 const getFetchAgent = function(_parsedURL) {
+  const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.VCP_PROXY;
+  if (proxyUrl && HttpsProxyAgent && _parsedURL.protocol === 'https:') {
+    return new HttpsProxyAgent(proxyUrl);
+  }
   return _parsedURL.protocol === 'http:' ? keepAliveHttpAgent : keepAliveHttpsAgent;
 };
 

@@ -878,6 +878,17 @@ app.use((req, res, next) => {
 
 app.get('/v1/models', async (req, res) => {
     const { default: fetch } = await import('node-fetch');
+    let agent = undefined;
+    const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.VCP_PROXY;
+    if (proxyUrl) {
+        try {
+            const { HttpsProxyAgent } = require('https-proxy-agent');
+            agent = new HttpsProxyAgent(proxyUrl);
+        } catch (e) {
+            // Ignore
+        }
+    }
+
     const appendSemanticRouterModels = (modelsData) => {
         const virtualModels = semanticModelRouter.getVirtualModels();
         if (!virtualModels.length) return modelsData;
@@ -903,6 +914,7 @@ app.get('/v1/models', async (req, res) => {
         const modelsApiUrl = `${apiUrl}/v1/models`;
         const apiResponse = await fetch(modelsApiUrl, {
             method: 'GET',
+            agent,
             headers: {
                 'Authorization': `Bearer ${apiKey}`,
                 ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] }),
@@ -968,6 +980,15 @@ app.get('/v1/models', async (req, res) => {
 
     } catch (error) {
         console.error('转发 /v1/models 请求时出错:', error.message, error.stack);
+        
+        // Return fallback virtual models even if fetch fails, so the frontend still has models to select!
+        const fallbackModelsData = appendSemanticRouterModels({ object: 'list', data: [] });
+        if (fallbackModelsData.data.length > 0) {
+            if (!res.headersSent) {
+                return res.status(200).json(fallbackModelsData);
+            }
+        }
+
         if (!res.headersSent) {
             res.status(500).json({ error: 'Internal Server Error', details: error.message });
         } else if (!res.writableEnded) {
