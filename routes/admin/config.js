@@ -120,6 +120,22 @@ module.exports = function(options) {
         try {
             const configPath = path.join(__dirname, '..', '..', 'config.env');
             await fs.writeFile(configPath, content, 'utf-8');
+            
+            // 解析并热更新 process.env 变量
+            const lines = content.split(/\r?\n/);
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith('#')) continue;
+                const idx = trimmed.indexOf('=');
+                if (idx <= 0) continue;
+                const key = trimmed.slice(0, idx).trim();
+                let val = trimmed.slice(idx + 1).trim();
+                if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                    val = val.slice(1, -1);
+                }
+                process.env[key] = val;
+            }
+            
             await pluginManager.loadPlugins();
             res.json({ message: '主配置已成功保存并已重新加载。' });
         } catch (error) {

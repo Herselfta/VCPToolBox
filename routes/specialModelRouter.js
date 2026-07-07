@@ -86,12 +86,18 @@ router.post('/v1/chat/completions', async (req, res) => {
     };
 
     try {
+        const customApiUrl = req.headers['x-vcp-api-url'] || req.headers['x-upstream-api-url'];
+        const customApiKey = req.headers['x-vcp-api-key'] || req.headers['x-upstream-api-key'];
+
+        const activeApiUrl = customApiUrl || process.env.API_URL || API_URL;
+        const activeApiKey = customApiKey || process.env.API_Key || API_KEY;
+
         const { default: fetch } = await import('node-fetch');
-        const apiResponse = await fetch(`${API_URL}/v1/chat/completions`, {
+        const apiResponse = await fetch(`${activeApiUrl}/v1/chat/completions`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${API_KEY}`,
+                'Authorization': `Bearer ${activeApiKey}`,
                 ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] }),
                 'Accept': req.headers['accept'] || 'application/json',
             },
@@ -128,12 +134,18 @@ router.post('/v1/embeddings', async (req, res) => {
     if (DEBUG_MODE) console.log(`[SpecialRouter] 正在处理向量化模型 (透传): ${model}`);
 
     try {
+        const customApiUrl = req.headers['x-vcp-api-url'] || req.headers['x-upstream-api-url'];
+        const customApiKey = req.headers['x-vcp-api-key'] || req.headers['x-upstream-api-key'];
+
+        const activeApiUrl = customApiUrl || process.env.API_URL || API_URL;
+        const activeApiKey = customApiKey || process.env.API_Key || API_KEY;
+
         const { default: fetch } = await import('node-fetch');
-        const apiResponse = await fetch(`${API_URL}/v1/embeddings`, {
+        const apiResponse = await fetch(`${activeApiUrl}/v1/embeddings`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${API_KEY}`,
+                'Authorization': `Bearer ${activeApiKey}`,
                 ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] }),
                 'Accept': req.headers['accept'] || 'application/json',
             },

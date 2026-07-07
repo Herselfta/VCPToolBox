@@ -911,12 +911,18 @@ app.get('/v1/models', async (req, res) => {
     };
 
     try {
-        const modelsApiUrl = `${apiUrl}/v1/models`;
+        const customApiUrl = req.headers['x-vcp-api-url'] || req.headers['x-upstream-api-url'];
+        const customApiKey = req.headers['x-vcp-api-key'] || req.headers['x-upstream-api-key'];
+
+        const activeApiUrl = customApiUrl || process.env.API_URL || apiUrl;
+        const activeApiKey = customApiKey || process.env.API_Key || apiKey;
+
+        const modelsApiUrl = `${activeApiUrl}/v1/models`;
         const apiResponse = await fetch(modelsApiUrl, {
             method: 'GET',
             agent,
             headers: {
-                'Authorization': `Bearer ${apiKey}`,
+                'Authorization': `Bearer ${activeApiKey}`,
                 ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] }),
                 'Accept': req.headers['accept'] || 'application/json',
             },

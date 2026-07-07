@@ -1160,13 +1160,19 @@ class ChatCompletionHandler {
 
       await writeDebugLog('LogOutputAfterProcessing', finalUpstreamBody);
 
+      const customApiUrl = req.headers['x-vcp-api-url'] || req.headers['x-upstream-api-url'];
+      const customApiKey = req.headers['x-vcp-api-key'] || req.headers['x-upstream-api-key'];
+
+      const activeApiUrl = customApiUrl || process.env.API_URL || apiUrl;
+      const activeApiKey = customApiKey || process.env.API_Key || apiKey;
+
       let firstAiAPIResponse = await fetchWithRetry(
-        `${apiUrl}/v1/chat/completions`,
+        `${activeApiUrl}/v1/chat/completions`,
         {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
+            Authorization: `Bearer ${activeApiKey}`,
             ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] }),
             Accept: willStreamResponse ? 'text/event-stream' : req.headers['accept'] || 'application/json',
           },
