@@ -914,10 +914,24 @@ app.get('/v1/models', async (req, res) => {
         const customApiUrl = req.headers['x-vcp-api-url'] || req.headers['x-upstream-api-url'];
         const customApiKey = req.headers['x-vcp-api-key'] || req.headers['x-upstream-api-key'];
 
+        console.log(`[VCPToolBox - /v1/models] Incoming headers:`, JSON.stringify(req.headers));
+
         const activeApiUrl = customApiUrl || process.env.API_URL || apiUrl;
         const activeApiKey = customApiKey || process.env.API_Key || apiKey;
 
-        const modelsApiUrl = `${activeApiUrl}/v1/models`;
+        console.log(`[VCPToolBox - /v1/models] Using activeApiUrl: ${activeApiUrl}`);
+
+        let normalizedApiUrl = activeApiUrl.trim();
+        while (normalizedApiUrl.endsWith('/')) {
+            normalizedApiUrl = normalizedApiUrl.slice(0, -1);
+        }
+
+        const modelsApiUrl = normalizedApiUrl.endsWith('/v1')
+            ? `${normalizedApiUrl}/models`
+            : `${normalizedApiUrl}/v1/models`;
+
+        console.log(`[VCPToolBox - /v1/models] Resolved modelsApiUrl: ${modelsApiUrl}`);
+
         const apiResponse = await fetch(modelsApiUrl, {
             method: 'GET',
             agent,
