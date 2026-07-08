@@ -249,3 +249,7 @@ Plugin/.backup/
 Plugin/VCPQQBotServer/bot-node-sdk-main
 Plugin/VCPBridgeServer/bridge-config.json
 Plugin/WeatherReporter/weather_cache.json
+
+# ==== 定时任务数据 ====
+VCPTimedContacts/
+VCPTimedResults/

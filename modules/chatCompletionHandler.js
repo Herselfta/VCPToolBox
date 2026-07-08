@@ -1283,6 +1283,8 @@ class ChatCompletionHandler {
 
       const context = {
         ...this.config,
+        apiUrl: activeApiUrl,
+        apiKey: activeApiKey,
         toolExecutor: this.toolExecutor,
         ToolCallParser,
         abortController,

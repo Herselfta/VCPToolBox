@@ -61,14 +61,27 @@ class ContextFoldingV2 {
     async initialize(config, dependencies) {
         // 1. 加载插件独立 config.env
         const envPath = path.join(__dirname, 'config.env');
-        dotenv.config({ path: envPath });
+        let localEnv = {};
+        try {
+            const fs = require('fs');
+            if (fs.existsSync(envPath)) {
+                const fsContent = fs.readFileSync(envPath, 'utf-8');
+                localEnv = dotenv.parse(fsContent);
+            }
+        } catch (e) {
+            console.warn('[ContextFoldingV2] 读取本地 config.env 失败:', e.message);
+        }
 
-        this.summaryModel = process.env.FOLDING_SUMMARY_MODEL || 'gemini-3.1-flash-lite-preview';
-        this.summarySystemPrompt = (process.env.FOLDING_SUMMARY_SYSTEM_PROMPT || '').replace(/\\n/g, '\n');
-        this.summaryUserPrompt = (process.env.FOLDING_SUMMARY_USER_PROMPT || '').replace(/\\n/g, '\n');
-        this.minDepth = Math.max(2, parseInt(process.env.FOLDING_MIN_DEPTH) || 3);
-        this.maxRetries = parseInt(process.env.FOLDING_MAX_RETRIES) || 3;
-        this.maxConcurrentSummaries = Math.max(1, parseInt(process.env.FOLDING_SUMMARY_MAX_CONCURRENT, 10) || 5);
+        const isPlaceholder = (val) => !val || val.startsWith('YOUR_') || val.includes('_API_');
+        this.apiUrl = !isPlaceholder(localEnv.API_URL) ? localEnv.API_URL : process.env.API_URL;
+        this.apiKey = !isPlaceholder(localEnv.API_Key) ? localEnv.API_Key : process.env.API_Key;
+
+        this.summaryModel = localEnv.FOLDING_SUMMARY_MODEL || process.env.FOLDING_SUMMARY_MODEL || 'gemini-3.1-flash-lite-preview';
+        this.summarySystemPrompt = (localEnv.FOLDING_SUMMARY_SYSTEM_PROMPT || process.env.FOLDING_SUMMARY_SYSTEM_PROMPT || '').replace(/\\n/g, '\n');
+        this.summaryUserPrompt = (localEnv.FOLDING_SUMMARY_USER_PROMPT || process.env.FOLDING_SUMMARY_USER_PROMPT || '').replace(/\\n/g, '\n');
+        this.minDepth = Math.max(2, parseInt(localEnv.FOLDING_MIN_DEPTH || process.env.FOLDING_MIN_DEPTH) || 3);
+        this.maxRetries = parseInt(localEnv.FOLDING_MAX_RETRIES || process.env.FOLDING_MAX_RETRIES) || 3;
+        this.maxConcurrentSummaries = Math.max(1, parseInt(localEnv.FOLDING_SUMMARY_MAX_CONCURRENT || process.env.FOLDING_SUMMARY_MAX_CONCURRENT, 10) || 5);
 
         // 🌟 保存 PROJECT_BASE_PATH 到实例，供 _loadHotParams / _startHotParamsWatcher 使用
         this._projectBasePath = (config && config.PROJECT_BASE_PATH) || process.env.PROJECT_BASE_PATH || path.join(__dirname, '../../');
@@ -103,7 +116,7 @@ class ContextFoldingV2 {
         }
 
         // 4. 验证摘要 API 配置
-        if (!process.env.API_URL || !process.env.API_Key) {
+        if (!this.apiUrl || !this.apiKey) {
             console.warn('[ContextFoldingV2] API_URL 或 API_Key 未配置，摘要生成将不可用');
         }
 
@@ -507,8 +520,8 @@ class ContextFoldingV2 {
      * 返回 { summary, retryable429 }，其中 summary 为完整格式摘要文本
      */
     async _generateSummary(text) {
-        const apiUrl = process.env.API_URL;
-        const apiKey = process.env.API_Key;
+        const apiUrl = this.apiUrl;
+        const apiKey = this.apiKey;
 
         if (!apiUrl || !apiKey) {
             console.error('[ContextFoldingV2] API_URL 或 API_Key 未配置');

@@ -14,12 +14,12 @@ dotenv.config({ path: configPath });
 
 const {
     VSearchKey: API_KEY,
-    VSearchUrl: API_URL,
+    VSearchUrl: RAW_API_URL,
     VSearchModel: MODEL,
     GrokModel: GROK_MODEL,
     TavilyModel: TAVILY_MODEL,
     SummaryKey: SUMMARY_KEY,
-    SummaryUrl: SUMMARY_URL,
+    SummaryUrl: RAW_SUMMARY_URL,
     SummaryModel: SUMMARY_MODEL,
     VSearchMaxToken: MAX_TOKENS,
     MaxConcurrent: MAX_CONCURRENT,
@@ -29,6 +29,18 @@ const {
     KimiSearchMaxResults: KIMI_SEARCH_MAX_RESULTS,
     KimiSearchIncludeContent: KIMI_SEARCH_INCLUDE_CONTENT,
 } = process.env;
+
+const normalizeApiUrl = (url) => {
+    if (!url) return '';
+    let target = url.trim();
+    if (!target.includes('/v1/chat/completions')) {
+        target = target.replace(/\/$/, '') + '/v1/chat/completions';
+    }
+    return target;
+};
+
+const API_URL = normalizeApiUrl(RAW_API_URL);
+const SUMMARY_URL = normalizeApiUrl(RAW_SUMMARY_URL);
 
 const CONCURRENCY = parseInt(MAX_CONCURRENT, 10) || 5;
 const TOKENS = parseInt(MAX_TOKENS, 10) || 50000;
@@ -384,11 +396,20 @@ ${keywordList.map((kw, i) => `${i + 1}. ${kw}`).join('\n')}
                 finish(fullContent, true);
             }, Math.max(1, getRemainingMs(deadline)));
 
+            let buffer = '';
             response.data.on('data', chunk => {
-                const lines = chunk.toString().split('\n').filter(line => line.trim() !== '');
+                buffer += chunk.toString();
+                let boundary = buffer.lastIndexOf('\n');
+                if (boundary === -1) return;
+
+                const completeData = buffer.substring(0, boundary);
+                buffer = buffer.substring(boundary + 1);
+
+                const lines = completeData.split('\n').filter(line => line.trim() !== '');
                 for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        const dataStr = line.slice(6);
+                    const trimmedLine = line.trim();
+                    if (trimmedLine.startsWith('data:')) {
+                        const dataStr = trimmedLine.slice(5).trim();
                         if (dataStr === '[DONE]') continue;
                         try {
                             const json = JSON.parse(dataStr);

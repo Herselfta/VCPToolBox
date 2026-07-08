@@ -5,7 +5,7 @@
   "maxBriefListItems": 120,
   "maxExpandedPlugins": 4,
   "maxForcedCategoryPlugins": 12,
-  "maxInjectionChars": 16000,
+  "maxInjectionChars": 80000,
   "classificationDebounceMs": 1000,
   "classifierTimeoutMs": 30000,
   "useRagEmbeddings": true,

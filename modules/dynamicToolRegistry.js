@@ -630,7 +630,13 @@ class DynamicToolRegistry {
         const expandedRecords = Array.from(expandedKeys)
             .map((originKey) => this.catalog.get(originKey))
             .filter((record) => record && record.available)
-            .sort((a, b) => this._compareRecordsWithPinned(a, b));
+            .sort((a, b) => {
+                const aForced = directives.tools.has(a.pluginName) || Array.from(directives.tools).some((name) => this._matchesToolName(a, name));
+                const bForced = directives.tools.has(b.pluginName) || Array.from(directives.tools).some((name) => this._matchesToolName(b, name));
+                if (aForced && !bForced) return -1;
+                if (!aForced && bForced) return 1;
+                return this._compareRecordsWithPinned(a, b);
+            });
         if (expandedRecords.length > 0) {
             lines.push('');
             lines.push('Expanded tool usage:');
@@ -1285,11 +1291,19 @@ class DynamicToolRegistry {
             directives.tools.add(match[1].trim());
         }
 
+        const available = this._getAvailableRecords();
+        const lower = raw.toLowerCase();
+
+        // If the query explicitly mentions a tool's exact pluginName, force expand it
+        for (const record of available) {
+            if (record.pluginName && lower.includes(record.pluginName.toLowerCase())) {
+                directives.tools.add(record.pluginName);
+            }
+        }
+
         const strongVerb = /(expand|expose|show|list|display|full|details|完整|全部|展开|暴露|显示|列出|详情)/i;
         if (!strongVerb.test(raw)) return directives;
 
-        const available = this._getAvailableRecords();
-        const lower = raw.toLowerCase();
         const knownCategories = new Set();
         for (const record of available) {
             for (const category of this._recordCategories(record)) knownCategories.add(category);
@@ -1298,7 +1312,7 @@ class DynamicToolRegistry {
             if (lower.includes(category.toLowerCase())) directives.categories.add(category);
         }
         for (const record of available) {
-            const names = [record.pluginName, record.displayName, ...(record.commandIdentifiers || [])].filter(Boolean);
+            const names = [record.displayName, ...(record.commandIdentifiers || [])].filter(Boolean);
             if (names.some((name) => lower.includes(String(name).toLowerCase()))) {
                 directives.tools.add(record.pluginName);
             }
