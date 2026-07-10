@@ -420,7 +420,7 @@ function applyModelFallbackForAttempt(options, candidates, attemptIndex, debugMo
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 120000, modelFallbackCandidates = null } = {},
+  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 900000, modelFallbackCandidates = null } = {},
 ) {
   const { default: fetch } = await import('node-fetch');
   const maxAttempts = Math.max(
@@ -671,6 +671,7 @@ class ChatCompletionHandler {
       apiRetries,
       apiRetryDelay,
       RAGMemoRefresh,
+      apiConnectionTimeoutMs,
       enableRoleDivider, // 新增
       enableRoleDividerInLoop, // 新增
       roleDividerIgnoreList, // 新增
@@ -1183,6 +1184,7 @@ class ChatCompletionHandler {
           retries: apiRetries,
           delay: apiRetryDelay,
           debugMode: DEBUG_MODE,
+          connectionTimeout: apiConnectionTimeoutMs,
           modelFallbackCandidates: semanticModelFallbackCandidates,
           onRetry: async (attempt, errorInfo) => {
             if (!res.headersSent && isOriginalRequestStreaming) {
@@ -1296,6 +1298,7 @@ class ChatCompletionHandler {
         isToolResultError,
         formatToolResult,
         vcpToolUseForbidden,
+        apiConnectionTimeoutMs,
         semanticModelFallbackCandidates,
         oneRingResponseMeta,
         shouldProcessMedia,
