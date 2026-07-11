@@ -253,3 +253,4 @@ Plugin/WeatherReporter/weather_cache.json
 # ==== 定时任务数据 ====
 VCPTimedContacts/
 VCPTimedResults/
+/Plugin/AgentDream/dream_logs
