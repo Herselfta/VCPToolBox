@@ -18,7 +18,9 @@ const DEFAULT_CONFIG = Object.freeze({
     maxConcurrentTasks: 3,
     publicFolderPrefixes: ['公共'],
     ignoreFolders: ['node_modules', '.git'],
-    summaryPrompt: ''
+    summaryPrompt: '',
+    aliases: {},
+    agentFolders: {}
 });
 
 class VCPTimeLine {
@@ -70,8 +72,68 @@ class VCPTimeLine {
             ignoreFolders: Array.isArray(raw.ignoreFolders)
                 ? raw.ignoreFolders.map(String).map(item => item.trim()).filter(Boolean)
                 : [...DEFAULT_CONFIG.ignoreFolders],
-            summaryPrompt: String(raw.summaryPrompt || '').trim()
+            summaryPrompt: String(raw.summaryPrompt || '').trim(),
+            aliases: this._normalizeStringArrayMap(raw.aliases),
+            agentFolders: this._normalizeStringArrayMap(raw.agentFolders)
         };
+    }
+
+    _normalizeStringArrayMap(raw) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+        const result = {};
+        for (const [key, arr] of Object.entries(raw)) {
+            if (Array.isArray(arr)) {
+                const cleaned = arr.map(String).map(s => s.trim()).filter(Boolean);
+                if (cleaned.length) result[key] = cleaned;
+            }
+        }
+        return result;
+    }
+
+    _getValidAuthorNames(agentName) {
+        const aliases = this.config.aliases?.[agentName];
+        return new Set([agentName, ...(Array.isArray(aliases) ? aliases : [])]);
+    }
+
+    async _discoverAliases(agentName) {
+        const authors = new Set();
+        let topEntries = [];
+        try {
+            topEntries = await fsp.readdir(this.dailyNoteRoot, { withFileTypes: true });
+        } catch { return []; }
+
+        for (const entry of topEntries) {
+            if (entry.isDirectory() && this.shouldScanTopLevel(entry.name, agentName)) {
+                await this._scanAuthors(path.join(this.dailyNoteRoot, entry.name), authors, 0);
+            }
+        }
+        authors.delete(agentName);
+        return [...authors].sort();
+    }
+
+    async _scanAuthors(dir, authors, depth) {
+        if (depth > 5) return;
+        let entries = [];
+        try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+        for (const entry of entries) {
+            if (entry.isDirectory()) {
+                if (!this.config.ignoreFolders.includes(entry.name)) {
+                    await this._scanAuthors(path.join(dir, entry.name), authors, depth + 1);
+                }
+                continue;
+            }
+            if (!entry.isFile() || !/\.(md|txt)$/i.test(entry.name)) continue;
+            const fd = await fsp.open(path.join(dir, entry.name), 'r');
+            try {
+                const buf = Buffer.alloc(512);
+                await fd.read(buf, 0, 512, 0);
+                const firstLine = buf.toString('utf8').split(/\r?\n/).find(l => l.trim());
+                if (firstLine) {
+                    const header = this.parseMemoryHeader(firstLine + '\n');
+                    if (header) authors.add(header.author);
+                }
+            } finally { await fd.close(); }
+        }
     }
 
     async readConfig() {
@@ -309,35 +371,48 @@ class VCPTimeLine {
 
     async processMessages(messages) {
         if (!this.config.enabled || !Array.isArray(messages)) return messages;
-        const declarations = [];
-        messages.forEach((message, index) => {
-            if (message?.role !== 'system' && message?.role !== 'user') return;
-            const text = this.extractText(message.content);
-            for (const match of text.matchAll(new RegExp(PLACEHOLDER_REGEX.source, PLACEHOLDER_REGEX.flags))) {
-                declarations.push({ index, ...this.parsePlaceholder(match) });
-            }
-        });
-        if (declarations.length === 0) return messages;
 
-        const queryContext = await this.buildQueryContext(messages);
-        const replacements = await Promise.all(declarations.map(async declaration => ({
-            ...declaration,
-            content: await this.buildInjection(
+        // 整个上下文只接受第一个可信声明：system，或正文以“[系统”开头的 user。
+        // 先确定唯一声明，再以单次正则替换清除其余声明，避免注入内容被递归展开。
+        let declaration = null;
+        for (let index = 0; index < messages.length && !declaration; index++) {
+            const message = messages[index];
+            const text = this.extractText(message?.content);
+            const trusted = message?.role === 'system'
+                || (message?.role === 'user' && /^\s*\[系统/.test(text));
+            if (!trusted) continue;
+
+            const match = new RegExp(PLACEHOLDER_REGEX.source).exec(text);
+            if (match) declaration = { index, ...this.parsePlaceholder(match) };
+        }
+
+        let injection = '';
+        if (declaration) {
+            const queryContext = await this.buildQueryContext(messages);
+            injection = await this.buildInjection(
                 this.safeAgentName(declaration.agentName),
                 queryContext,
                 declaration.k,
                 declaration.threshold
-            )
-        })));
-
-        const result = messages.map(message => ({ ...message }));
-        for (const replacement of replacements) {
-            result[replacement.index].content = this.replaceText(
-                result[replacement.index].content,
-                text => text.replace(replacement.placeholder, replacement.content)
             );
         }
-        return result;
+
+        let accepted = false;
+        return messages.map((message, index) => ({
+            ...message,
+            content: this.replaceText(message.content, text =>
+                text.replace(
+                    new RegExp(PLACEHOLDER_REGEX.source, PLACEHOLDER_REGEX.flags),
+                    (...args) => {
+                        if (!accepted && declaration && index === declaration.index && args[0] === declaration.placeholder) {
+                            accepted = true;
+                            return injection;
+                        }
+                        return '';
+                    }
+                )
+            )
+        }));
     }
 
     parseMemoryHeader(content) {
@@ -354,8 +429,12 @@ class VCPTimeLine {
 
     shouldScanTopLevel(name, agentName) {
         const isTimelineDirectory = name.toLocaleLowerCase() === `${agentName}timeline`.toLocaleLowerCase();
-        return [agentName, ...this.config.publicFolderPrefixes].some(prefix => name.startsWith(prefix))
-            && !isTimelineDirectory;
+        if (isTimelineDirectory) return false;
+        const explicitFolders = this.config.agentFolders?.[agentName];
+        if (Array.isArray(explicitFolders) && explicitFolders.length > 0) {
+            return explicitFolders.includes(name);
+        }
+        return [agentName, ...this.config.publicFolderPrefixes].some(prefix => name.startsWith(prefix));
     }
 
     async discoverMemories(agentName, startMonth, endMonth) {
@@ -379,7 +458,8 @@ class VCPTimeLine {
                 const fullPath = path.join(dir, entry.name);
                 const content = await fsp.readFile(fullPath, 'utf8');
                 const header = this.parseMemoryHeader(content);
-                if (!header || header.author !== agentName) continue;
+                const validNames = this._getValidAuthorNames(agentName);
+                if (!header || !validNames.has(header.author)) continue;
                 if (startMonth && header.month < startMonth) continue;
                 if (endMonth && header.month > endMonth) continue;
                 const lines = content.split(/\r?\n/);
@@ -694,7 +774,31 @@ class VCPTimeLine {
             const started = this.startTask(req.params.agentName, 'summary', req.body || {});
             res.status(started.accepted ? 202 : 409).json({ success: started.accepted, ...started });
         });
+        route('get', '/vcp-timeline/agents/:agentName/discover-aliases', async (req, res) => {
+            const agentName = this.safeAgentName(req.params.agentName);
+            const suggestions = await this._discoverAliases(agentName);
+            res.json({ success: true, suggestions });
+        });
+
+        route('get', '/vcp-timeline/agents/:agentName/folders', async (req, res) => {
+            const agentName = this.safeAgentName(req.params.agentName);
+            const allDirs = (await fsp.readdir(this.dailyNoteRoot, { withFileTypes: true }))
+                .filter(e => e.isDirectory())
+                .map(e => e.name)
+                .filter(name => name.toLocaleLowerCase() !== `${agentName}timeline`.toLocaleLowerCase());
+            const explicitFolders = this.config.agentFolders?.[agentName];
+            const currentlyIncluded = Array.isArray(explicitFolders) && explicitFolders.length > 0
+                ? new Set(explicitFolders)
+                : new Set(allDirs.filter(name =>
+                    [agentName, ...this.config.publicFolderPrefixes].some(prefix => name.startsWith(prefix))
+                  ));
+            res.json({
+                success: true,
+                folders: allDirs.map(name => ({ name, included: currentlyIncluded.has(name) }))
+            });
+        });
     }
 }
+
 
 module.exports = new VCPTimeLine();
