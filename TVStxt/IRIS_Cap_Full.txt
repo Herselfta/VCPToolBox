@@ -1,0 +1,13 @@
+# I.R.I.S. 能力包 · Full（完整共生）
+
+在 Lite 全部模块之上，角色壳再引用：
+
+7. `{{VCPContactToolBox}}` — 跨 Agent、主人通知、主动话题、日程、闹钟
+8. `{{VCPSearchToolBox}}` — 联网检索、UrlFetch、B 站等
+9. `{{VCPFileToolBox}}` — 文件与命令行
+10. （可选）`{{VCPMediaToolBox}}` — 生图/点歌等
+11. （可选）`{{VarRendering}}` + 表情包相关 — Vchat 呈现
+
+Full 目标：记忆闭环 + 主动行动 + 查资料 + 动手改文件；多媒体/渲染按客户端需要追加。
+
+梦境能力不在此包：入梦走 `DreamIRIS` + `{{VarDreamTool}}`。

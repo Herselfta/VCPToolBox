@@ -18,5 +18,13 @@
   "VCPContactToolBox": {
     "file": "ContactToolBox.txt",
     "description": "该收纳箱收纳了各种通讯、社交、消息推送，话题管理，日程管理，日常小工具相关的工具，用于动态向 Agent 提供说明。"
+  },
+  "VCPIRISCapLite": {
+    "file": "IRIS_Cap_Lite.txt",
+    "description": "I.R.I.S. Lite 能力档位说明：日记+回忆+接线的最小共生模块清单。"
+  },
+  "VCPIRISCapFull": {
+    "file": "IRIS_Cap_Full.txt",
+    "description": "I.R.I.S. Full 能力档位说明：在 Lite 上叠加通讯、搜索、文件与可选多媒体的完整共生模块清单。"
   }
 }

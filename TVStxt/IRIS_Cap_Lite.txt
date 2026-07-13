@@ -1,0 +1,12 @@
+# I.R.I.S. 能力包 · Lite（最小共生）
+
+本包是**档位说明**，不替代具体 ToolBox。角色壳应同时引用下列占位符，才会真正注入手册：
+
+1. `{{VarToolList}}` — 调用总格式
+2. `{{VarVCPGuide}}` — 调用总则
+3. `{{VarDailyNoteGuide}}` — 日记协议
+4. `{{VCPMemoToolBox}}` — LightMemo / DeepMemo / TopicMemo
+5. `{{VarIRISWiring}}` — I.R.I.S. 索引与行为接线
+6. `{{VCPDynamicTools}}` — 动态插件发现
+
+Lite 目标：会记、会忆、会按协议调用工具；不含通讯刷屏、重文件开发、多媒体创作。
