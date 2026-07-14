@@ -282,3 +282,5 @@ Plugin/.backup/
 
 # ==== 开发SDK ====
 Plugin/VCPQQBotServer/bot-node-sdk-main
+/VCPTimedResults
+Plugin/VCPBridgeServer/bridge-config.json
