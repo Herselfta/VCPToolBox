@@ -267,6 +267,11 @@ class LightMemoPlugin {
         }
 
         const normalizedK = Math.max(1, Math.floor(this._parseNumber(k, 5)));
+        const potentialFieldConfig = this.vectorDBManager?.ragParams?.KnowledgeBaseManager?.geodesicRerank || {};
+        const geoCandidateMultiplier = useGeodesicRerank
+            ? Math.max(1, Math.min(10, Number(potentialFieldConfig.candidateKMultiplier) || 2))
+            : 1;
+        const geoCandidateK = Math.max(normalizedK, Math.ceil(normalizedK * geoCandidateMultiplier));
         const normalizedCoreTags = this._parseStringArray(core_tags);
         const normalizedCoreBoostFactor = this._parseNumber(core_boost_factor, 1.33);
 
@@ -378,18 +383,22 @@ class LightMemoPlugin {
             });
 
             // 🚀 优化：放宽 BM25 限制。如果 BM25 没搜到，可能是分词太碎或太死板，此时允许向量检索兜底。
+            const bm25PoolK = Math.max(normalizedK * 5, geoCandidateK);
             topByKeyword = scoredCandidates
                 .filter(c => c.bm25Score > 0)
                 .sort((a, b) => b.bm25Score - a.bm25Score)
-                .slice(0, normalizedK * 5); // 增加候选数量
+                .slice(0, bm25PoolK);
 
-            // 如果关键词匹配太少，补充一些向量相似度高的（这里先取前 N 个作为兜底候选）
-            if (topByKeyword.length < normalizedK) {
-                console.log(`[LightMemo] BM25 results insufficient (${topByKeyword.length}), adding fallback candidates.`);
+            // 测地线需要独立候选预算；BM25 命中不足时补齐到专属候选 K。
+            if (topByKeyword.length < geoCandidateK) {
+                console.log(
+                    `[LightMemo] BM25 results insufficient for candidate pool ` +
+                    `(${topByKeyword.length}/${geoCandidateK}), adding fallback candidates.`
+                );
                 const existingIds = new Set(topByKeyword.map(c => c.label));
                 const fallbacks = scoredCandidates
                     .filter(c => !existingIds.has(c.label))
-                    .slice(0, normalizedK * 2);
+                    .slice(0, geoCandidateK - topByKeyword.length);
                 topByKeyword = [...topByKeyword, ...fallbacks];
             }
         }
@@ -401,9 +410,15 @@ class LightMemoPlugin {
         if (!queryVector) {
             throw new Error("查询内容向量化失败。");
         }
+        // 保留原始查询坐标；TagMemo 增强后 queryVector 会被替换，四层影子读出需要同时观察 q 与 q'。
+        const originalQueryVector = queryVector instanceof Float32Array
+            ? new Float32Array(queryVector)
+            : new Float32Array(queryVector);
 
         let tagBoostInfo = null;
         let tagBoostEnergyField = null;
+        let tagBoostEnergyFieldProvenance = null;
+        let tagBoostArtifactBundle = null;
         // 🚀【新步骤】如果启用了 TagMemo，则调用 KBM 的功能来增强向量
         if (tag_boost > 0 && this.vectorDBManager && typeof this.vectorDBManager.applyTagBoost === 'function') {
             const hasCore = normalizedCoreTags.length > 0;
@@ -422,6 +437,8 @@ class LightMemoPlugin {
                 queryVector = boostResult.vector;
                 tagBoostInfo = boostResult.info;
                 tagBoostEnergyField = boostResult.energyField || null;
+                tagBoostEnergyFieldProvenance = boostResult.energyFieldProvenance || null;
+                tagBoostArtifactBundle = boostResult.artifactBundle || null;
 
                 if (tagBoostInfo) {
                     const matched = tagBoostInfo.matchedTags || [];
@@ -479,11 +496,18 @@ class LightMemoPlugin {
                 score: c.hybridScore || c.vectorScore || 0
             }));
 
-            const geoConfig = this.vectorDBManager.ragParams?.KnowledgeBaseManager?.geodesicRerank || {};
             const reranked = this.vectorDBManager.geodesicRerank(geoInput, {
-                alpha: geoConfig.alpha,
-                minGeoSamples: geoConfig.minGeoSamples,
-                energyField: tagBoostEnergyField
+                alpha: potentialFieldConfig.alpha,
+                minGeoSamples: potentialFieldConfig.minGeoSamples,
+                energyField: tagBoostEnergyField,
+                energyFieldProvenance: tagBoostEnergyFieldProvenance,
+                originalQueryVector,
+                enhancedQueryVector: queryVector,
+                queryGeometryState: {
+                    epa: tagBoostInfo?.epa || null,
+                    pyramid: tagBoostInfo?.pyramid || null
+                },
+                artifactBundle: tagBoostArtifactBundle
             });
 
             // Map results back with geodesic metadata
@@ -495,7 +519,11 @@ class LightMemoPlugin {
             }));
 
             const geoCount = rankedCandidates.filter(r => r.potentialFieldV91).length;
-            console.log(`[LightMemo] 🌟 V9.1: Potential-field rerank complete. ${geoCount}/${rankedCandidates.length} candidates with field contribution.`);
+            console.log(
+                `[LightMemo] 🌟 V9.1: Potential-field rerank complete. ` +
+                `${geoCount}/${rankedCandidates.length} candidates with field contribution ` +
+                `(requestedK=${normalizedK}, candidateK=${geoCandidateK}, multiplier=${geoCandidateMultiplier}).`
+            );
         }
 
         // 取top K
@@ -582,9 +610,9 @@ class LightMemoPlugin {
 
     /**
      * TagMemo V9.1 单轨寻址对照。
-     * 模式 A：固定对称候选超集比较 KNN / V9.1 / 独立 Rerank。
-     * 模式 B：比较原始 KNN 与 V9.1 端到端 Top-K，并可加入独立 Rerank。
-     * 保留旧 TagMemoAB 命令和模式名，仅作为工具协议兼容入口，不再加载 V8.3 资产。
+     * 模式 A：固定对称候选超集比较 KNN / V9.1向量增强 / V9.1+测地线 / 独立 Rerank。
+     * 模式 B：同时比较三路端到端 Top-K，并可加入独立 Rerank。
+     * 测地线对照在每次 A/B 中固定执行，不再由 potential_field 参数二选一。
      */
     async handleTagMemoAB(args = {}) {
         if (!this.vectorDBManager || typeof this.vectorDBManager.applyTagBoost !== 'function') {
@@ -612,7 +640,6 @@ class LightMemoPlugin {
         )));
         const coreTags = this._parseStringArray(args.core_tags || args.coreTags);
         const coreBoostFactor = this._parseNumber(args.core_boost_factor, 1.33);
-        const usePotentialField = this._parseBoolean(args.potential_field ?? args.use_potential_field, true);
         const useBM25 = this._parseBooleanAlias(
             [['BM25', args.BM25], ['bm25', args.bm25], ['use_bm25', args.use_bm25]],
             true,
@@ -675,11 +702,21 @@ class LightMemoPlugin {
                 score: item.vectorScore || 0
             }))
             .sort((a, b) => b.score - a.score);
-        const v91Ranked = usePotentialField && boost.energyField
+
+        // A/B 固定双跑：同一增强向量、同一查询能量场、同一候选全集。
+        // vectorRanked 是“不开测地线”的 V9.1 基线；geodesicRanked 是唯一实验变量。
+        const geodesicRanked = boost.energyField
             ? this.vectorDBManager.geodesicRerank(v91VectorRanked, {
                 artifactBundle: snapshot.bundle,
                 tagMemoVersion: 'v9',
-                energyField: boost.energyField
+                energyField: boost.energyField,
+                energyFieldProvenance: boost.energyFieldProvenance,
+                originalQueryVector: queryVector,
+                enhancedQueryVector: boost.vector,
+                queryGeometryState: {
+                    epa: boost.info?.epa || null,
+                    pyramid: boost.info?.pyramid || null
+                }
             })
             : v91VectorRanked;
 
@@ -692,8 +729,12 @@ class LightMemoPlugin {
                 snapshot,
                 boost,
                 vectorRanked: v91VectorRanked,
-                ranked: v91Ranked,
-                top: v91Ranked.slice(0, abMode === 'A' ? topL : k)
+                ranked: v91VectorRanked,
+                top: v91VectorRanked.slice(0, abMode === 'A' ? topL : k)
+            },
+            geodesic: {
+                ranked: geodesicRanked,
+                top: geodesicRanked.slice(0, abMode === 'A' ? topL : k)
             }
         };
 
@@ -727,7 +768,6 @@ class LightMemoPlugin {
             runs,
             k,
             tagBoost,
-            usePotentialField,
             rerankRun
         }));
     }
@@ -776,10 +816,12 @@ class LightMemoPlugin {
         if (abMode === 'A') {
             addToPool(runs.knn.ranked, topL);
             addToPool(runs.v9.ranked, topL);
+            addToPool(runs.geodesic.ranked, topL);
             if (useBM25) addToPool(this._buildBm25TopIds(query, candidates, topL), topL);
         } else {
             addToPool(runs.knn.top, k);
             addToPool(runs.v9.top, k);
+            addToPool(runs.geodesic.top, k);
         }
 
         const pool = [...poolById.values()].filter(item => item.text);
@@ -847,6 +889,32 @@ class LightMemoPlugin {
         return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
     }
 
+    _formatGeometryShadow(item) {
+        const shadow = item?.geo_geometry_shadow;
+        if (!shadow || typeof shadow !== 'object') return '';
+        const fmt = value => Number(value || 0).toFixed(3);
+        const weights = shadow.queryWeights || {};
+        const direction = Number(shadow.directionConsistency || 0);
+        const lift = Number(shadow.vectorLift || 0);
+        const guarded = shadow.nodeFieldGuarded === true ? ' 节点场守卫' : '';
+        return `D/S/T/C4/F=${fmt(shadow.directScore)}/${fmt(shadow.structuralScore)}/` +
+            `${fmt(shadow.thematicScore)}/${fmt(shadow.closureScore)}/${fmt(shadow.fusedScore)}` +
+            ` W=${fmt(weights.direct)}/${fmt(weights.structural)}/${fmt(weights.thematic)}` +
+            ` Dir=${fmt(direction)} Lift=${lift >= 0 ? '+' : ''}${lift.toFixed(4)}${guarded}`;
+    }
+
+    _formatGeometryAuxiliary(item) {
+        if (!item || item.geo_aux_enabled !== true) return '辅助=关闭';
+        const fmt = value => Number(value || 0).toFixed(4);
+        const reliability = Number(item.geo_aux_reliability || 0).toFixed(3);
+        const identity = Number(item.geo_identity_anchor_strength || 0).toFixed(3);
+        const identityMark = item.geo_identity_anchor_eligible === true ? '✓' : '×';
+        return `主轨=${fmt(item.geo_base_bonus)} 辅助=${fmt(item.geo_aux_bonus)} ` +
+            `地板=${fmt(item.geo_aux_target_floor)}(几何${fmt(item.geo_aux_geometry_floor)}` +
+            `/身份${fmt(item.geo_aux_identity_floor)}) 可靠=${reliability} ` +
+            `身份锚=${identityMark}${identity} 原因=${item.geo_aux_reason || 'unknown'}`;
+    }
+
     _formatTagMemoKernelAB({ query, candidates, runs, topL, k, tagBoost, useBM25, rerankRun }) {
         const bm25Top = useBM25 ? this._buildBm25TopIds(query, candidates, topL) : [];
         const sources = new Map();
@@ -857,15 +925,17 @@ class LightMemoPlugin {
         });
         add(runs.knn.ranked, 'KNN');
         add(runs.v9.ranked, 'V9.1');
+        add(runs.geodesic.ranked, '测地线');
         add(bm25Top, 'BM25');
 
         const knnMap = this._rankMap(runs.knn.ranked);
         const v91Map = this._rankMap(runs.v9.ranked);
+        const geoMap = this._rankMap(runs.geodesic.ranked);
         const rerankMap = rerankRun?.available ? this._rankMap(rerankRun.ranked) : new Map();
         const byId = new Map(candidates.map(item => [Number(item.label), item]));
         const ids = [...sources.keys()].sort((a, b) => {
-            const bestA = Math.min(knnMap.get(a)?.rank || Infinity, v91Map.get(a)?.rank || Infinity);
-            const bestB = Math.min(knnMap.get(b)?.rank || Infinity, v91Map.get(b)?.rank || Infinity);
+            const bestA = Math.min(knnMap.get(a)?.rank || Infinity, v91Map.get(a)?.rank || Infinity, geoMap.get(a)?.rank || Infinity);
+            const bestB = Math.min(knnMap.get(b)?.rank || Infinity, v91Map.get(b)?.rank || Infinity, geoMap.get(b)?.rank || Infinity);
             return bestA - bestB;
         });
 
@@ -873,7 +943,8 @@ class LightMemoPlugin {
         let text = `\n[--- TagMemo V9.1 对照模式 A：固定对称候选超集 ---]\n`;
         text += `查询: ${query}\n参数: topL=${topL}, displayK=${k}, tag_boost=${tagBoost}, BM25=${useBM25}, compare_rerank=${Boolean(rerankRun)}\n`;
         text += `V9.1资产: ${runs.v9.snapshot.bundle.artifactSig}\n`;
-        text += `对称超集: ${ids.length} 个唯一 chunk（KNN ∪ V9.1${useBM25 ? ' ∪ BM25' : ''}），表格展示 ${displayedIds.length} 条\n`;
+        text += `固定实验变量: V9.1不开测地线 vs V9.1开启测地线（同一增强向量、能量场与候选全集）\n`;
+        text += `对称超集: ${ids.length} 个唯一 chunk（KNN ∪ V9.1 ∪ 测地线${useBM25 ? ' ∪ BM25' : ''}），表格展示 ${displayedIds.length} 条\n`;
         if (rerankRun) {
             text += rerankRun.available
                 ? `Rerank横向基线: ${rerankRun.candidateCount} 个对称候选${rerankRun.partialFailure ? '（部分批次失败）' : ''}\n\n`
@@ -881,70 +952,122 @@ class LightMemoPlugin {
         } else {
             text += '\n';
         }
-        text += `| # | 候选记忆 | 进入路径 | KNN排名/分数 | V9.1排名/分数 | ΔRank(V9.1-KNN) |${rerankRun ? ' Rerank排名/分数 | ΔRank(V9.1-Rerank) |' : ''}\n`;
-        text += `|---:|---|---|---:|---:|---:|${rerankRun ? '---:|---:|' : ''}\n`;
+        text += `| # | 候选记忆 | 进入路径 | KNN排名/分数 | V9.1无测地线 | V9.1+测地线 | ΔRank(测地线-无测地线) | 曲线分/置信度 |${rerankRun ? ' Rerank排名/分数 |' : ''}\n`;
+        text += `|---:|---|---|---:|---:|---:|---:|---:|${rerankRun ? '---:|' : ''}\n`;
         displayedIds.forEach((id, index) => {
             const candidate = byId.get(id);
             const knn = knnMap.get(id);
             const v91 = v91Map.get(id);
+            const geo = geoMap.get(id);
             const reranked = rerankMap.get(id);
-            const delta = knn && v91 ? knn.rank - v91.rank : null;
-            const rerankDelta = reranked && v91 ? reranked.rank - v91.rank : null;
+            const delta = v91 && geo ? v91.rank - geo.rank : null;
             const fmt = value => value ? `${value.rank}/${value.score.toFixed(4)}` : '—';
-            const rerankCells = rerankRun
-                ? ` ${fmt(reranked)} | ${rerankDelta === null ? '—' : rerankDelta > 0 ? `+${rerankDelta}` : rerankDelta} |`
+            const geoItem = geo?.item;
+            const contactTags = Array.isArray(geoItem?.geo_contact_tags)
+                ? geoItem.geo_contact_tags.slice(0, 4).map(contact => {
+                    const marker = contact.exact ? '=' : '~';
+                    const source = contact.sourceType
+                        ? `@${contact.sourceType}${Number.isFinite(contact.hop) ? `:${contact.hop}` : ''}`
+                        : '';
+                    return `${marker}${contact.name || contact.id}:${Number(contact.potential || 0).toFixed(2)}${source}`;
+                }).join(', ')
                 : '';
-            text += `| ${index + 1} | ${this._escapeMarkdownCell(this._shortMemoryText(candidate?.text))} | ${[...sources.get(id)].join('+')} | ${fmt(knn)} | ${fmt(v91)} | ${delta === null ? '—' : delta > 0 ? `+${delta}` : delta} |${rerankCells}\n`;
+            const geometryShadow = this._formatGeometryShadow(geoItem);
+            const geometryAuxiliary = this._formatGeometryAuxiliary(geoItem);
+            const diagnostics = (geoItem && Number(geoItem.geo_score) > 0
+                ? `${geoItem.geo_evidence_class || 'unknown'} ` +
+                    `${Number(geoItem.geo_score).toFixed(4)}/${Number(geoItem.geo_confidence || 0).toFixed(3)} ` +
+                    `+${Number(geoItem.geo_bonus || 0).toFixed(4)}≤${Number(geoItem.geo_bonus_cap || 0).toFixed(3)}` +
+                    `${Number(geoItem.geo_direct_semantic_hits || 0) > 0
+                        ? ` 直锚=${Number(geoItem.geo_direct_semantic_hits)}` +
+                            `/强${Number(geoItem.geo_direct_semantic_strength || 0).toFixed(2)}` +
+                            `/奖信${Number(geoItem.geo_reward_confidence || 0).toFixed(2)}`
+                        : ''}` +
+                    `${contactTags ? `<br>${this._escapeMarkdownCell(contactTags)}` : ''}`
+                : `守卫/0${geoItem?.geo_guard_reason ? `<br>${this._escapeMarkdownCell(geoItem.geo_guard_reason)}` : ''}`) +
+                `${geometryShadow ? `<br>${this._escapeMarkdownCell(geometryShadow)}` : ''}` +
+                `${geometryAuxiliary ? `<br>${this._escapeMarkdownCell(geometryAuxiliary)}` : ''}`;
+            text += `| ${index + 1} | ${this._escapeMarkdownCell(this._shortMemoryText(candidate?.text))} | ${[...sources.get(id)].join('+')} | ${fmt(knn)} | ${fmt(v91)} | ${fmt(geo)} | ${delta === null ? '—' : delta > 0 ? `+${delta}` : delta} | ${diagnostics} |${rerankRun ? ` ${fmt(reranked)} |` : ''}\n`;
         });
-        text += `\n说明: 正 ΔRank 表示 V9.1 相对基线将候选前移。Rerank（开启时）只重排同一候选池，不扩展召回集合。本模式用于观察 V9.1 增强与势能场对原始 KNN 排序的影响。\n`;
+        text += `\n说明: 正 ΔRank 表示开启测地线后相对同一 V9.1 向量基线前移；诊断依次显示证据等级、曲线分/置信度、最终奖励≤等级上限。direct/structural/thematic 的排序权限逐级降低；@seed/@core/@emergent:n 表示接触场节点来源。D/S/T/C4/F 分别表示直接层、结构层、主题层、查询—候选闭合层和有界融合分；W 为查询动态权重，Dir 为候选顺序正向导通一致性，Lift 为增强查询相对原查询的余弦提升。辅助生产轨不替换主轨，只在节点场证据、类别证据、融合分与闭合度同时过门时补足保守奖励地板；几何地板与严格身份锚地板取最大值而不叠加。C4/Lift 不可独立发奖，节点场守卫候选保持无测地线分数。Rerank 只重排同一对称候选池。\n`;
         text += `[--- 模式 A 结束 ---]\n`;
         return text;
     }
 
-    _formatTagMemoProductAB({ query, runs, k, tagBoost, usePotentialField, rerankRun }) {
+    _formatTagMemoProductAB({ query, runs, k, tagBoost, rerankRun }) {
         const knnTop = runs.knn.top;
         const v91Top = runs.v9.top;
+        const geoTop = runs.geodesic.top;
         const knnIds = new Set(knnTop.map(item => Number(item.id ?? item.label)));
         const v91Ids = new Set(v91Top.map(item => Number(item.id ?? item.label)));
-        const overlap = [...knnIds].filter(id => v91Ids.has(id));
-        const knnOnly = [...knnIds].filter(id => !v91Ids.has(id));
-        const v91Only = [...v91Ids].filter(id => !knnIds.has(id));
+        const geoIds = new Set(geoTop.map(item => Number(item.id ?? item.label)));
+        const geoOverlap = [...v91Ids].filter(id => geoIds.has(id));
+        const vectorOnly = [...v91Ids].filter(id => !geoIds.has(id));
+        const geoOnly = [...geoIds].filter(id => !v91Ids.has(id));
         const knnMap = this._rankMap(knnTop);
         const v91Map = this._rankMap(v91Top);
+        const geoMap = this._rankMap(geoTop);
         const rerankMap = rerankRun?.available ? this._rankMap(rerankRun.ranked) : new Map();
         const rerankIds = new Set(rerankRun?.available ? rerankRun.ranked.map(item => Number(item.id ?? item.label)) : []);
-        const rerankKnnOverlap = [...rerankIds].filter(id => knnIds.has(id)).length;
         const rerankV91Overlap = [...rerankIds].filter(id => v91Ids.has(id)).length;
+        const rerankGeoOverlap = [...rerankIds].filter(id => geoIds.has(id)).length;
         const items = new Map();
-        [...knnTop, ...v91Top, ...(rerankRun?.ranked || [])]
+        [...knnTop, ...v91Top, ...geoTop, ...(rerankRun?.ranked || [])]
             .forEach(item => items.set(Number(item.id ?? item.label), item));
-        const union = [...new Set([...v91Ids, ...knnIds, ...rerankIds])];
+        const union = [...new Set([...knnIds, ...v91Ids, ...geoIds, ...rerankIds])];
 
         let text = `\n[--- TagMemo V9.1 对照模式 B：端到端寻址 ---]\n`;
-        text += `查询: ${query}\n参数: k=${k}, tag_boost=${tagBoost}, potential_field=${usePotentialField}, compare_rerank=${Boolean(rerankRun)}\n`;
+        text += `查询: ${query}\n参数: k=${k}, tag_boost=${tagBoost}, geodesic_comparison=always, compare_rerank=${Boolean(rerankRun)}\n`;
         text += `V9.1资产: ${runs.v9.snapshot.bundle.artifactSig}\n`;
-        text += `重合=${overlap.length}/${k} (${(overlap.length / k * 100).toFixed(1)}%) | KNN独占=${knnOnly.length} | V9.1独占=${v91Only.length}\n`;
+        text += `无测地线/测地线重合=${geoOverlap.length}/${k} (${(geoOverlap.length / k * 100).toFixed(1)}%) | 无测地线独占=${vectorOnly.length} | 测地线独占=${geoOnly.length}\n`;
         if (rerankRun) {
             text += rerankRun.available
-                ? `Rerank Top-${rerankRun.ranked.length}: 与KNN重合=${rerankKnnOverlap} | 与V9.1重合=${rerankV91Overlap}${rerankRun.partialFailure ? ' | 部分批次失败' : ''}\n\n`
+                ? `Rerank Top-${rerankRun.ranked.length}: 与无测地线重合=${rerankV91Overlap} | 与测地线重合=${rerankGeoOverlap}${rerankRun.partialFailure ? ' | 部分批次失败' : ''}\n\n`
                 : `Rerank横向基线: 不可用（${rerankRun.error}）\n\n`;
         } else {
             text += '\n';
         }
-        text += `| 记忆片段 | KNN排名/分数 | V9.1排名/分数 |${rerankRun ? ' Rerank排名/分数 |' : ''} 归属 |\n`;
-        text += `|---|---:|---:|${rerankRun ? '---:|' : ''}---|\n`;
+        text += `| 记忆片段 | KNN | V9.1无测地线 | V9.1+测地线 | 曲线分/置信度 |${rerankRun ? ' Rerank |' : ''} 归属 |\n`;
+        text += `|---|---:|---:|---:|---:|${rerankRun ? '---:|' : ''}---|\n`;
         union.forEach(id => {
             const knnItem = knnMap.get(id);
             const v91Item = v91Map.get(id);
+            const geoItem = geoMap.get(id);
             const reranked = rerankMap.get(id);
             const owners = [];
             if (knnItem) owners.push('KNN');
             if (v91Item) owners.push('V9.1');
+            if (geoItem) owners.push('测地线');
             if (reranked) owners.push('Rerank');
             const fmt = value => value ? `${value.rank}/${value.score.toFixed(4)}` : '—';
-            text += `| ${this._escapeMarkdownCell(this._shortMemoryText(items.get(id)?.text, 100))} | ${fmt(knnItem)} | ${fmt(v91Item)} |${rerankRun ? ` ${fmt(reranked)} |` : ''} ${owners.join('+') || '—'} |\n`;
+            const geoData = geoItem?.item;
+            const contactTags = Array.isArray(geoData?.geo_contact_tags)
+                ? geoData.geo_contact_tags.slice(0, 4).map(contact => {
+                    const marker = contact.exact ? '=' : '~';
+                    const source = contact.sourceType
+                        ? `@${contact.sourceType}${Number.isFinite(contact.hop) ? `:${contact.hop}` : ''}`
+                        : '';
+                    return `${marker}${contact.name || contact.id}:${Number(contact.potential || 0).toFixed(2)}${source}`;
+                }).join(', ')
+                : '';
+            const geometryShadow = this._formatGeometryShadow(geoData);
+            const geometryAuxiliary = this._formatGeometryAuxiliary(geoData);
+            const diagnostics = (geoData && Number(geoData.geo_score) > 0
+                ? `${geoData.geo_evidence_class || 'unknown'} ` +
+                    `${Number(geoData.geo_score).toFixed(4)}/${Number(geoData.geo_confidence || 0).toFixed(3)} ` +
+                    `+${Number(geoData.geo_bonus || 0).toFixed(4)}≤${Number(geoData.geo_bonus_cap || 0).toFixed(3)}` +
+                    `${Number(geoData.geo_direct_semantic_hits || 0) > 0
+                        ? ` 直锚=${Number(geoData.geo_direct_semantic_hits)}` +
+                            `/强${Number(geoData.geo_direct_semantic_strength || 0).toFixed(2)}` +
+                            `/奖信${Number(geoData.geo_reward_confidence || 0).toFixed(2)}`
+                        : ''}` +
+                    `${contactTags ? `<br>${this._escapeMarkdownCell(contactTags)}` : ''}`
+                : `守卫/0${geoData?.geo_guard_reason ? `<br>${this._escapeMarkdownCell(geoData.geo_guard_reason)}` : ''}`) +
+                `${geometryShadow ? `<br>${this._escapeMarkdownCell(geometryShadow)}` : ''}` +
+                `${geometryAuxiliary ? `<br>${this._escapeMarkdownCell(geometryAuxiliary)}` : ''}`;
+            text += `| ${this._escapeMarkdownCell(this._shortMemoryText(items.get(id)?.text, 100))} | ${fmt(knnItem)} | ${fmt(v91Item)} | ${fmt(geoItem)} | ${diagnostics} |${rerankRun ? ` ${fmt(reranked)} |` : ''} ${owners.join('+') || '—'} |\n`;
         });
-        text += `\nV9.1 独占项用于人工判断拓扑增强是否抵达原始 KNN 未命中的有效记忆；KNN 独占项用于检查 V9.1 是否发生召回损失或主题漂移。Rerank（开启时）在两路 Top-K 并集上建立独立横向基线。\n`;
+        text += `\n测地线独占项用于判断曲线算法是否抵达无测地线 V9.1 未命中的有效记忆；无测地线独占项用于检查曲线重排的召回损失。两路始终共享同一增强向量、能量场和候选全集。D/S/T/C4/F、W、Dir、Lift 保留完整几何诊断；生产辅助只读取通过可靠度门控后的保守地板差额，C4/Lift 不独立发奖，节点场守卫保持零辅助。\n`;
         text += `[--- 模式 B 结束 ---]\n`;
         return text;
     }
@@ -1100,12 +1223,20 @@ class LightMemoPlugin {
                 return {
                     vector: boostResult.vector instanceof Float32Array ? boostResult.vector : new Float32Array(boostResult.vector),
                     info: boostResult.info || null,
-                    energyField: boostResult.energyField || null
+                    energyField: boostResult.energyField || null,
+                    energyFieldProvenance: boostResult.energyFieldProvenance || null,
+                    artifactBundle: boostResult.artifactBundle || null
                 };
             }
         }
 
-        return { vector: baseVector, info: null, energyField: null };
+        return {
+            vector: baseVector,
+            info: null,
+            energyField: null,
+            energyFieldProvenance: null,
+            artifactBundle: null
+        };
     }
 
     _energyFieldSimilarity(fieldA, fieldB) {
