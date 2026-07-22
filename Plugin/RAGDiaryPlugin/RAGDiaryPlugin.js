@@ -4170,8 +4170,8 @@ class RAGDiaryPlugin {
     async getBatchEmbeddings(texts) {
         if (!texts || !Array.isArray(texts) || texts.length === 0) return [];
 
-        const apiKey = process.env.API_Key;
-        const apiUrl = process.env.API_URL;
+        const apiKey = process.env.EMBEDDING_API_KEY || process.env.API_Key;
+        const apiUrl = process.env.EMBEDDING_API_URL || process.env.API_URL;
 
         if (!apiKey || !apiUrl) {
             console.error('[RAGDiaryPlugin] Embedding API credentials not configured (API_Key / API_URL).');
