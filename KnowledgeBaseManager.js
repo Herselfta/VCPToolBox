@@ -31,6 +31,7 @@ const DatabaseCoordinator = require('./modules/knowledgeBase/databaseCoordinator
 const KnowledgeBaseFileWatcher = require('./modules/knowledgeBase/fileWatcher');
 const IngestionPipeline = require('./modules/knowledgeBase/ingestionPipeline');
 const SearchService = require('./modules/knowledgeBase/searchService');
+const TagConsistencyService = require('./modules/knowledgeBase/tagConsistencyService');
 
 // 尝试加载 Rust Vexus 引擎
 let VexusIndex = null;
@@ -57,7 +58,7 @@ class KnowledgeBaseManager {
             // ⚠️ 务必确认环境变量 VECTORDB_DIMENSION 与模型一致 (3-small通常为1536)
             dimension: parseInt(process.env.VECTORDB_DIMENSION) || 3072,
 
-            batchWindow: parseInt(process.env.KNOWLEDGEBASE_BATCH_WINDOW_MS, 10) || 2000,
+            batchWindow: parseInt(process.env.KNOWLEDGEBASE_BATCH_WINDOW_MS, 10) || 1000,
             maxBatchSize: parseInt(process.env.KNOWLEDGEBASE_MAX_BATCH_SIZE, 10) || 50,
             indexSaveDelay: parseInt(process.env.KNOWLEDGEBASE_INDEX_SAVE_DELAY, 10) || 120000,
             tagIndexSaveDelay: parseInt(process.env.KNOWLEDGEBASE_TAG_INDEX_SAVE_DELAY, 10) || 300000,
@@ -85,6 +86,10 @@ class KnowledgeBaseManager {
 
             tagBlacklist: new Set((process.env.TAG_BLACKLIST || '').split(',').map(t => t.trim()).filter(Boolean)),
             tagBlacklistSuper: (process.env.TAG_BLACKLIST_SUPER || '').split(',').map(t => t.trim()).filter(Boolean),
+            maxTagsPerFile: (() => {
+                const value = parseInt(process.env.KNOWLEDGEBASE_MAX_TAGS_PER_FILE, 10);
+                return Number.isFinite(value) && value > 0 ? value : 50;
+            })(),
             tagExpandMaxCount: parseInt(process.env.TAG_EXPAND_MAX_COUNT, 10) || 30,
             fullScanOnStartup: (process.env.KNOWLEDGEBASE_FULL_SCAN_ON_STARTUP || 'true').toLowerCase() === 'true',
             // 语言置信度补偿配置
@@ -145,6 +150,10 @@ class KnowledgeBaseManager {
         this.externalMutationActive = false;
         this.externalMutationOwner = null;
         this.externalMutationQueueLength = 0;
+        // 索引收集窗口在长耗时外部变更期间到期时，只设置闩锁；
+        // 变更提交后立即补刷，避免复用 Rust 冷却时间或创建重复定时器。
+        this.externalMutationBatchDeferred = false;
+        this.externalMutationDeleteBatchDeferred = false;
         this._externalMutationTail = Promise.resolve();
 
         // 🛡️ 同一时刻只允许一个 Rust recoverFromSqlite 打开知识库。
@@ -201,6 +210,9 @@ class KnowledgeBaseManager {
         });
         this.ingestionPipeline = new IngestionPipeline(this);
         this.searchService = new SearchService(this);
+        this.tagConsistencyService = new TagConsistencyService(this, {
+            VexusIndex
+        });
     }
 
     async initialize() {
@@ -352,6 +364,18 @@ class KnowledgeBaseManager {
     checkpointAndAssertDatabaseHealthy(reason = 'manual-checkpoint') {
         this.sqliteHealthManager.syncFromOwner(this);
         const healthy = this.sqliteHealthManager.checkpointAndAssertHealthy(reason);
+        this.sqliteHealthManager.syncToOwner(this);
+        return healthy;
+    }
+
+    /**
+     * Rust/rusqlite 派生写完成后的专用屏障。
+     * 先淘汰长期存活的 better-sqlite3 连接及其 pager/WAL/SHM 视图，
+     * 再由新连接执行 checkpoint + quick_check；普通 JS 写不走此低频路径。
+     */
+    reopenAndAssertDatabaseHealthy(reason = 'rust-write-barrier') {
+        this.sqliteHealthManager.syncFromOwner(this);
+        const healthy = this.sqliteHealthManager.reopenAndAssertHealthy(reason);
         this.sqliteHealthManager.syncToOwner(this);
         return healthy;
     }
@@ -719,6 +743,22 @@ class KnowledgeBaseManager {
     }
 
     /**
+     * 使用当前文件过滤与 Tag 清洗规则生成只读一致性快照。
+     * 此阶段不请求 Embedding，也不修改 SQLite / Vexus 索引。
+     */
+    async previewTagConsistency() {
+        return await this.tagConsistencyService.createPreview();
+    }
+
+    /**
+     * 确认并应用先前的 Tag 一致性快照。
+     * 执行前会在排他维护窗口内重算摘要；快照过期或真相变化时拒绝执行。
+     */
+    async applyTagConsistencyPreview(token) {
+        return await this.tagConsistencyService.applyPreview(token);
+    }
+
+    /**
      * 主动触发 TagMemo V9.1 全量自学习训练。
      * 该入口会清空 1% 阈值累计计数、重建 V9.1 派生资产，并清理退休的 V8.3 预计算。
      */
@@ -973,7 +1013,9 @@ class KnowledgeBaseManager {
     }
 
     _extractTags(content) {
-        return extractTags(content, this.config);
+        return extractTags(content, this.config, {
+            maxTags: this.config.maxTagsPerFile
+        });
     }
 
     /**
