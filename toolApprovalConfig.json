@@ -9,6 +9,13 @@
   "approvalList": [
     "PowerShellExecutor",
     "ServerPowerShellExecutor",
-    "FileOperator"
+    "FileOperator:WriteFile",
+    "FileOperator:WriteEscapedFile",
+    "FileOperator:EditFile",
+    "FileOperator:AppendFile",
+    "FileOperator:ApplyDiff",
+    "FileOperator:DeleteFile",
+    "FileOperator:MoveFile",
+    "FileOperator:RenameFile"
   ]
 }

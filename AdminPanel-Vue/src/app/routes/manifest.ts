@@ -25,6 +25,7 @@ export type AppRouteId =
   | "onering-manager"
   | "agent-timeline-manager"
   | "claw-mail-manager"
+  | "heartbeat-manager"
   | "agent-emotion-manager"
   | "forum-assistant-config"
   | "agent-scores"
@@ -203,6 +204,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     path: "/claw-mail-manager",
     title: "Agent 信箱",
     icon: "mark_email_unread",
+    requiresAuth: true,
+    navGroup: "agentContent",
+    showInSidebar: true,
+  },
+  {
+    id: "heartbeat-manager",
+    routeName: "HeartbeatManager",
+    path: "/heartbeat-manager",
+    title: "Agent 心跳",
+    icon: "monitor_heart",
     requiresAuth: true,
     navGroup: "agentContent",
     showInSidebar: true,

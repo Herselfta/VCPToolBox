@@ -206,6 +206,26 @@ function loadAgentsFromLocalConfig() {
     }
 }
 
+function listAgents() {
+    return Object.values(AGENTS).map(agent => ({
+        name: agent.name,
+        baseName: agent.baseName,
+        modelId: agent.id,
+        description: agent.description
+    }));
+}
+
+function getAgentSummary(agentName) {
+    const agent = AGENTS[agentName];
+    if (!agent) return null;
+    return {
+        name: agent.name,
+        baseName: agent.baseName,
+        modelId: agent.id,
+        description: agent.description
+    };
+}
+
 // --- Context Management ---
 
 function getAgentSessionHistory(agentName, sessionId = 'default_user_session') {
@@ -1210,5 +1230,7 @@ module.exports = {
     reloadConfig: loadAgentsFromLocalConfig,
     listDelegations,
     getDelegationDetail,
-    cancelDelegation
+    cancelDelegation,
+    listAgents,
+    getAgentSummary
 };

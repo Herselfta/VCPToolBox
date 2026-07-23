@@ -38,6 +38,8 @@ export type * from './plugin'
 
 export { clawMailApi } from './clawMail'
 export type * from './clawMail'
+export { heartbeatApi } from './heartbeat'
+export type * from './heartbeat'
 
 export { vcpTimelineApi } from './vcpTimeline'
 export type * from './vcpTimeline'

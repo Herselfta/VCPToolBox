@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "agents": {
+    "Nova": {
+      "enabled": true,
+      "heartbeatFile": "heartbeats/Nova.md",
+      "intervalMinutes": 30,
+      "activeHours": { "start": "08:00", "end": "23:00", "timezone": "Asia/Shanghai" },
+      "allowedTools": ["TimedTaskQuery", "DailyNoteQuery", "VCPChrome"],
+      "maxNotificationsPerRun": 1
+    }
+  }
+}

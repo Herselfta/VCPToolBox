@@ -113,6 +113,7 @@ module.exports = function (
   mount("/", "clawMail"); // Handles /claw-mail/*
   mount("/", "tarotDivination"); // Handles /tarot-divination/*
   mount("/", "toolCallRecords"); // Handles /tool-call-records/*
+  mount("/", "heartbeat"); // Handles /heartbeat/*
 
   return adminApiRouter;
 };

@@ -1,0 +1,30 @@
+{
+  "manifestVersion": "1.0.0",
+  "name": "AgentHeartbeat",
+  "displayName": "Agent 主动心跳",
+  "version": "1.0.0",
+  "description": "周期唤醒 Agent 执行巡检，无事静默，有事通过 AgentMessage 推送。",
+  "author": "VCP",
+  "pluginType": "hybridservice",
+  "entryPoint": { "type": "nodejs", "command": "node AgentHeartbeat.js" },
+  "communication": { "protocol": "direct", "timeout": 15000 },
+  "configSchema": {
+    "HEARTBEAT_ENABLED": { "type": "boolean", "default": false },
+    "HEARTBEAT_DEFAULT_INTERVAL_MINUTES": { "type": "number", "default": 30 },
+    "HEARTBEAT_DEFAULT_ACTIVE_START": { "type": "string", "default": "08:00" },
+    "HEARTBEAT_DEFAULT_ACTIVE_END": { "type": "string", "default": "23:00" },
+    "HEARTBEAT_MAX_RUN_SECONDS": { "type": "number", "default": 600 },
+    "HEARTBEAT_MAX_SUMMARY_CHARS": { "type": "number", "default": 1200 },
+    "HEARTBEAT_MAX_NOTIFICATION_CHARS": { "type": "number", "default": 1200 },
+    "HEARTBEAT_RETRY_MINUTES": { "type": "number", "default": 5 },
+    "HEARTBEAT_MAX_CONSECUTIVE_FAILURES": { "type": "number", "default": 3 },
+    "HEARTBEAT_RUN_HISTORY_LIMIT": { "type": "number", "default": 100 },
+    "HEARTBEAT_STATE_DIR": { "type": "string", "default": "./Plugin/AgentHeartbeat/state" }
+  },
+  "capabilities": {
+    "invocationCommands": [{
+      "commandIdentifier": "AgentHeartbeat",
+      "description": "管理 Agent 心跳。command 可为 status、trigger、enable、disable、reload；agentName 为目标 Agent。"
+    }]
+  }
+}
